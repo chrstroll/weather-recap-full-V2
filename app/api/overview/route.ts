@@ -1,3 +1,4 @@
+// app/api/overview/route.ts
 import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
@@ -27,22 +28,52 @@ type Snapshot = {
   };
 };
 
-/* ---------- scoring helper ---------- */
+/* ============================================================
+   Fetch the REAL 1-day accuracy from /api/accuracy,
+   and compute a composite weather accuracy score (0–100).
+   ============================================================ */
+async function computeCompositeScore(lat: number, lon: number): Promise<number> {
+  try {
+    const accuracyUrl = `https://weather-recap-full-v2.vercel.app/api/accuracy?lat=${lat}&lon=${lon}&horizon=1`;
+    const res = await fetch(accuracyUrl, { cache: "no-store" });
+    if (!res.ok) return 50;
 
-function scoreFromSnapshot(snap: Snapshot) {
-  const temps = snap.daily.temperature_2m_max || [];
-  if (!temps.length) return null;
+    const data = await res.json();
+    const tempMAE = data.summary.mae ?? 0;        // °C
+    const windMAE = data.summary.windMAE ?? 0;    // km/h
 
-  const max = Math.max(...temps);
-  const min = Math.min(...temps);
-  const range = max - min;
-  const raw = Math.max(0, 100 - range * 5);
+    // Compute rain MAE from rows
+    let precipErrors: number[] = [];
+    for (const r of data.rows ?? []) {
+      if (typeof r.deltas?.rain === "number") {
+        precipErrors.push(Math.abs(r.deltas.rain));
+      }
+    }
+    const precipMAE =
+      precipErrors.length > 0
+        ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
+        : 0;
 
-  return Math.round(raw);
+    // Convert raw errors → sub-scores
+    const tempScore = Math.max(0, 100 - tempMAE * 10);
+    const windScore = Math.max(0, 100 - windMAE * 2);
+    const precipScore = Math.max(0, 100 - precipMAE * 20);
+
+    // Weighted composite
+    const composite =
+      0.5 * tempScore +
+      0.3 * windScore +
+      0.2 * precipScore;
+
+    return Math.round(composite);
+  } catch {
+    return 50;
+  }
 }
 
-/* ---------- latest snapshot helper ---------- */
-
+/* ============================================================
+   Load latest snapshot for a place
+   ============================================================ */
 async function getLatestSnapshot(
   lat: number,
   lon: number
@@ -50,14 +81,13 @@ async function getLatestSnapshot(
   const today = new Date().toISOString().slice(0, 10);
   const todayKey = `twr:snap:${today}:${lat},${lon}`;
 
-  // 1. Try today first
+  // Try today's snapshot
   let snapJson = await redis.get(todayKey);
 
-  // 2. If missing, look at index of all snapshots
+  // If missing, fallback to latest snapshot key
   if (!snapJson) {
     const indexKey = `twr:index:${lat},${lon}`;
     const keys = (await redis.smembers(indexKey)) as string[];
-
     if (!keys || keys.length === 0) return null;
 
     const latestKey = keys.sort().at(-1)!;
@@ -65,6 +95,7 @@ async function getLatestSnapshot(
     if (!snapJson) return null;
   }
 
+  // Parse as Snapshot
   if (typeof snapJson === "string") {
     return JSON.parse(snapJson) as Snapshot;
   }
@@ -72,23 +103,17 @@ async function getLatestSnapshot(
   return snapJson as Snapshot;
 }
 
-/* ---------- starter places for new users ---------- */
-
+/* ============================================================
+   Starter places for brand-new users
+   ============================================================ */
 const STARTER_PLACES: Place[] = [
-  {
-    name: "San Francisco, California, United States",
-    lat: 37.77,
-    lon: -122.42,
-  },
-  {
-    name: "London, England, United Kingdom",
-    lat: 51.51,
-    lon: -0.13,
-  },
+  { name: "San Francisco, California, United States", lat: 37.77, lon: -122.42 },
+  { name: "London, England, United Kingdom",          lat: 51.51, lon: -0.13 },
 ];
 
-/* ---------- GET handler (per user) ---------- */
-
+/* ============================================================
+   GET handler — per-user place list + composite score
+   ============================================================ */
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
@@ -103,10 +128,10 @@ export async function GET(req: Request) {
 
     const placesKey = `twr:user:${userId}:places`;
 
-    // Load this user's places
+    // Get user's saved place list
     let rawPlaces = (await redis.smembers(placesKey)) as any[];
 
-    // If this is a brand-new user, seed with starter places
+    // First-time user → seed with starter places
     if (!rawPlaces || rawPlaces.length === 0) {
       await Promise.all(
         STARTER_PLACES.map((p) =>
@@ -117,13 +142,12 @@ export async function GET(req: Request) {
     }
 
     if (!rawPlaces || rawPlaces.length === 0) {
-      // Shouldn't happen, but be defensive.
       return Response.json({ status: "no-places", items: [] });
     }
 
-    // Parse places from stored JSON
+    // Parse JSON places
     const places: Place[] = rawPlaces.map((p) =>
-      typeof p === "string" ? (JSON.parse(p) as Place) : (p as Place)
+      typeof p === "string" ? JSON.parse(p) : p
     );
 
     const today = new Date().toISOString().slice(0, 10);
@@ -140,10 +164,11 @@ export async function GET(req: Request) {
           };
         }
 
-        const score = scoreFromSnapshot(snap);
+        // REAL composite forecast accuracy score
+        const score = await computeCompositeScore(place.lat, place.lon);
 
         return {
-          place: snap.place, // includes normalized name
+          place: snap.place,
           snapshotDate: snap.snapshotDate,
           score,
         };
