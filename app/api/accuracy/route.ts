@@ -109,6 +109,9 @@ export async function GET(req: Request) {
       }
 
       const date = current.snapshotDate;
+      // Skip today; we only show up to yesterday
+      const today = new Date().toISOString().slice(0, 10);
+      if (date === today) continue;
 
       const idxActual = indexForDate(current.daily, date);
       const idxPred = indexForDate(prev.daily, date);
