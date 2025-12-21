@@ -8,19 +8,13 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-type Place = {
-  name: string;
-  lat: number;
-  lon: number;
-};
+type Place = { name: string; lat: number; lon: number };
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
 
 function coercePlace(item: any): Place | null {
-  // Upstash can return either raw objects or strings depending on how data was inserted.
-  // We tolerate both to avoid silently skipping snapshots.
   let obj: any = item;
 
   if (typeof item === "string") {
@@ -39,7 +33,11 @@ function coercePlace(item: any): Place | null {
 
   if (!name || Number.isNaN(lat) || Number.isNaN(lon)) return null;
 
-  return { name, lat, lon };
+  return { name, lat: round2(lat), lon: round2(lon) };
+}
+
+function placeKey(p: Place) {
+  return `${p.lat},${p.lon}`;
 }
 
 async function fetchDaily(lat: number, lon: number) {
@@ -63,32 +61,37 @@ async function fetchDaily(lat: number, lon: number) {
 
 export async function GET() {
   try {
-    const rawItems = (await redis.smembers("twr:places")) as any[];
+    // 1) Start with legacy global places
+    const rawGlobal = (await redis.smembers("twr:places")) as any[];
+    const globalPlaces = (rawGlobal || []).map(coercePlace).filter(Boolean) as Place[];
 
-    const places: Place[] = (rawItems || [])
-      .map(coercePlace)
-      .filter((p): p is Place => Boolean(p))
-      .map((p) => ({
-        ...p,
-        // Normalize key precision so snapshot keys match track keys
-        lat: round2(p.lat),
-        lon: round2(p.lon),
-      }));
+    // 2) Union in all per-user places (robust fix)
+    const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
+
+    const userPlacesArrays = await Promise.all(
+      userIds.map(async (uid) => {
+        const raw = (await redis.smembers(`twr:user:${uid}:places`)) as any[];
+        return (raw || []).map(coercePlace).filter(Boolean) as Place[];
+      })
+    );
+
+    const allPlaces = [...globalPlaces, ...userPlacesArrays.flat()];
+
+    // De-dupe by lat,lon
+    const map = new Map<string, Place>();
+    for (const p of allPlaces) map.set(placeKey(p), p);
+    const places = [...map.values()];
 
     if (places.length === 0) {
       return Response.json({ status: "no-places" });
     }
 
-    // Use UTC date for snapshot partitioning (stable)
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10);
 
     await Promise.all(
       places.map(async (place) => {
         const { name, lat, lon } = place;
-
         const daily = await fetchDaily(lat, lon);
-
-        // Normalize the name when writing the snapshot
         const cleanName = await normalizePlaceName(lat, lon, name);
 
         const key = `twr:snap:${today}:${lat},${lon}`;

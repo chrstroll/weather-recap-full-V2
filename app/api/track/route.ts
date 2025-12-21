@@ -20,24 +20,19 @@ export async function POST(req: Request) {
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
 
-    // Normalize the place name (city, state, country)
     const fallbackName = (name as string) || "";
     const cleanName = await normalizePlaceName(rl, rlo, fallbackName);
 
-    const placeObject = {
-      name: cleanName,
-      lat: rl,
-      lon: rlo,
-    };
+    const placeObject = { name: cleanName, lat: rl, lon: rlo };
 
-    // 1️⃣ Per-user key for their set of places
+    // Track the user globally so snapshot job can union all user places
+    await redis.sadd("twr:users", userId);
+
+    // Per-user set
     const userPlacesKey = `twr:user:${userId}:places`;
-
     await redis.sadd(userPlacesKey, JSON.stringify(placeObject));
 
-    // 2️⃣ CRITICAL FIX:
-    // ALSO add to the global places set so the snapshot cron picks it up
-    // Do NOT stringify here — snapshot job expects objects
+    // Legacy global set (keep, but snapshot job will no longer depend solely on it)
     await redis.sadd("twr:places", placeObject);
 
     return new Response("ok");
