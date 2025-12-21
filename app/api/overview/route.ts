@@ -28,37 +28,10 @@ type Snapshot = {
   };
 };
 
-async function computeCompositeScore(lat: number, lon: number): Promise<number> {
-  try {
-    const accuracyUrl = `https://weather-recap-full-v2.vercel.app/api/accuracy?lat=${lat}&lon=${lon}&horizon=1`;
-    const res = await fetch(accuracyUrl, { cache: "no-store" });
-    if (!res.ok) return 50;
-
-    const data = await res.json();
-    const tempMAE = data.summary.mae ?? 0;     // °C
-    const windMAE = data.summary.windMAE ?? 0; // km/h
-
-    let precipErrors: number[] = [];
-    for (const r of data.rows ?? []) {
-      if (typeof r.deltas?.rain === "number") {
-        precipErrors.push(Math.abs(r.deltas.rain));
-      }
-    }
-    const precipMAE =
-      precipErrors.length > 0
-        ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
-        : 0;
-
-    const tempScore = Math.max(0, 100 - tempMAE * 10);
-    const windScore = Math.max(0, 100 - windMAE * 2);
-    const precipScore = Math.max(0, 100 - precipMAE * 20);
-
-    const composite = 0.5 * tempScore + 0.3 * windScore + 0.2 * precipScore;
-    return Math.round(composite);
-  } catch {
-    return 50;
-  }
-}
+const STARTER_PLACES: Place[] = [
+  { name: "San Francisco, California, United States", lat: 37.77, lon: -122.42 },
+  { name: "London, England, United Kingdom", lat: 51.51, lon: -0.13 },
+];
 
 async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | null> {
   const today = new Date().toISOString().slice(0, 10);
@@ -82,10 +55,45 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
   return snapJson as Snapshot;
 }
 
-const STARTER_PLACES: Place[] = [
-  { name: "San Francisco, California, United States", lat: 37.77, lon: -122.42 },
-  { name: "London, England, United Kingdom", lat: 51.51, lon: -0.13 },
-];
+async function computeCompositeScore(lat: number, lon: number): Promise<number | null> {
+  try {
+    const accuracyUrl = `https://weather-recap-full-v2.vercel.app/api/accuracy?lat=${lat}&lon=${lon}&horizon=1`;
+    const res = await fetch(accuracyUrl, { cache: "no-store" });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+
+    // ✅ If accuracy is not ready, do NOT invent a perfect score
+    if (data?.status !== "ok" || !Array.isArray(data?.rows) || data.rows.length === 0) {
+      return null;
+    }
+
+    const tempMAE = typeof data.summary?.mae === "number" ? data.summary.mae : null;     // °C
+    const windMAE = typeof data.summary?.windMAE === "number" ? data.summary.windMAE : null; // km/h
+    if (tempMAE == null || windMAE == null) return null;
+
+    let precipErrors: number[] = [];
+    for (const r of data.rows) {
+      if (typeof r?.deltas?.rain === "number") {
+        precipErrors.push(Math.abs(r.deltas.rain));
+      }
+    }
+
+    const precipMAE =
+      precipErrors.length > 0
+        ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
+        : 0;
+
+    const tempScore = Math.max(0, 100 - tempMAE * 10);
+    const windScore = Math.max(0, 100 - windMAE * 2);
+    const precipScore = Math.max(0, 100 - precipMAE * 20);
+
+    const composite = 0.5 * tempScore + 0.3 * windScore + 0.2 * precipScore;
+    return Math.round(composite);
+  } catch {
+    return null;
+  }
+}
 
 export async function GET(req: Request) {
   try {
@@ -96,15 +104,17 @@ export async function GET(req: Request) {
       return Response.json({ status: "missing-user-id", items: [] }, { status: 400 });
     }
 
-    // ✅ Track user globally for snapshot unioning
+    // Track user globally so snapshot job can union all user places
     await redis.sadd("twr:users", userId);
 
     const placesKey = `twr:user:${userId}:places`;
-
     let rawPlaces = (await redis.smembers(placesKey)) as any[];
 
+    // Seed starter places if empty
     if (!rawPlaces || rawPlaces.length === 0) {
-      await Promise.all(STARTER_PLACES.map((p) => redis.sadd(placesKey, JSON.stringify(p))));
+      await Promise.all(
+        STARTER_PLACES.map((p) => redis.sadd(placesKey, JSON.stringify(p)))
+      );
       rawPlaces = (await redis.smembers(placesKey)) as any[];
     }
 
@@ -112,12 +122,17 @@ export async function GET(req: Request) {
       return Response.json({ status: "no-places", items: [] });
     }
 
-    const places: Place[] = rawPlaces.map((p) => (typeof p === "string" ? JSON.parse(p) : p));
+    // Parse JSON places
+    const places: Place[] = rawPlaces.map((p) =>
+      typeof p === "string" ? JSON.parse(p) : p
+    );
 
-    // ✅ Best-effort reconcile: ensure these places also exist in legacy global set
-    // (safe/idempotent; does not change user experience)
+    // Best-effort reconcile: ensure these places exist in legacy global set
+    // (safe/idempotent)
     await Promise.all(
-      places.map((p) => redis.sadd("twr:places", { name: p.name, lat: p.lat, lon: p.lon }))
+      places.map((p) =>
+        redis.sadd("twr:places", { name: p.name, lat: p.lat, lon: p.lon })
+      )
     );
 
     const today = new Date().toISOString().slice(0, 10);
@@ -126,6 +141,7 @@ export async function GET(req: Request) {
       places.map(async (place) => {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
+        // If no snapshot at all, we can’t score
         if (!snap) {
           return { place, snapshotDate: today, score: null };
         }
@@ -135,7 +151,7 @@ export async function GET(req: Request) {
         return {
           place: snap.place,
           snapshotDate: snap.snapshotDate,
-          score,
+          score, // number or null
         };
       })
     );
