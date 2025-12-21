@@ -145,9 +145,17 @@ export async function GET(req: Request) {
       return Response.json({ status: "no-places", items: [] });
     }
 
-    // Parse JSON places
+        // Parse JSON places
     const places: Place[] = rawPlaces.map((p) =>
       typeof p === "string" ? JSON.parse(p) : p
+    );
+
+    // Ensure all user places are also in the global places set (for snapshot cron)
+    // Idempotent: adding duplicates to a Redis set is safe
+    await Promise.all(
+      places.map((p) =>
+        redis.sadd("twr:places", { name: p.name, lat: p.lat, lon: p.lon })
+      )
     );
 
     const today = new Date().toISOString().slice(0, 10);
