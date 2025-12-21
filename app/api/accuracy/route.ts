@@ -29,20 +29,17 @@ type Snapshot = {
   daily: SnapshotDaily;
 };
 
-// Helper: mean of an array
 function mean(values: number[]): number {
   if (!values.length) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
-// Helper: difference in whole days between two YYYY-MM-DD strings
 function dayDiff(a: string, b: string): number {
   const toDate = (s: string) => new Date(s + "T00:00:00Z").getTime();
   const diffMs = toDate(a) - toDate(b);
   return Math.round(diffMs / (24 * 60 * 60 * 1000));
 }
 
-// Helper: find index for a given date in the daily.time array
 function indexForDate(daily: SnapshotDaily, date: string): number {
   return daily.time?.findIndex((t) => t === date) ?? -1;
 }
@@ -58,13 +55,10 @@ export async function GET(req: Request) {
     );
 
     if (Number.isNaN(lat) || Number.isNaN(lon)) {
-      return NextResponse.json(
-        { error: "Missing lat/lon" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Missing lat/lon" }, { status: 400 });
     }
 
-    // Match the rounding we use when storing snapshots
+    // Match snapshot rounding
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
 
@@ -73,27 +67,37 @@ export async function GET(req: Request) {
 
     if (!snapKeys || snapKeys.length === 0) {
       return NextResponse.json({
+        status: "insufficient-data",
         horizon,
-        meta: { tempUnit: "C", windUnit: "km/h", precipUnit: "mm", humidityUnit: "%" },
-        summary: { mae: 0, bias: 0, windMAE: 0 },
+        meta: {
+          tempUnit: "C",
+          windUnit: "km/h",
+          precipUnit: "mm",
+          humidityUnit: "%",
+        },
+        summary: { mae: null, bias: null, windMAE: null },
         rows: [],
       });
     }
 
-    // Load all snapshots and sort by snapshotDate
     const snaps: Snapshot[] = [];
     for (const key of snapKeys) {
       const raw = await redis.get(key);
       if (!raw) continue;
-      const snap = typeof raw === "string" ? (JSON.parse(raw) as Snapshot) : (raw as Snapshot);
+      const snap =
+        typeof raw === "string"
+          ? (JSON.parse(raw) as Snapshot)
+          : (raw as Snapshot);
+
       if (snap?.snapshotDate && snap.daily?.time) {
         snaps.push(snap);
       }
     }
 
-    snaps.sort((a, b) => (a.snapshotDate < b.snapshotDate ? -1 : 1));
+    snaps.sort((a, b) =>
+      a.snapshotDate < b.snapshotDate ? -1 : 1
+    );
 
-    // Build accuracy rows by comparing snapshot at D with snapshot at D - horizon
     const rows: any[] = [];
 
     for (let i = 0; i < snaps.length; i++) {
@@ -103,37 +107,26 @@ export async function GET(req: Request) {
 
       const prev = snaps[j];
 
-      // Make sure these snapshots are exactly `horizon` days apart
       if (dayDiff(current.snapshotDate, prev.snapshotDate) !== horizon) {
         continue;
       }
 
       const date = current.snapshotDate;
-      // Skip today; we only show up to yesterday
       const today = new Date().toISOString().slice(0, 10);
       if (date === today) continue;
 
       const idxActual = indexForDate(current.daily, date);
       const idxPred = indexForDate(prev.daily, date);
-
       if (idxActual < 0 || idxPred < 0) continue;
 
       const actual = {
-        tmax: current.daily.temperature_2m_max?.[idxActual] ?? null,
-        tmin: current.daily.temperature_2m_min?.[idxActual] ?? null,
-        wind: current.daily.windspeed_10m_max?.[idxActual] ?? null,
-        humidity: current.daily.relative_humidity_2m_mean?.[idxActual] ?? null,
-        rain: current.daily.rain_sum?.[idxActual] ?? null,
-        snow: current.daily.snowfall_sum?.[idxActual] ?? null,
+        tmax: current.daily.temperature_2m_max[idxActual],
+        wind: current.daily.windspeed_10m_max[idxActual],
       };
 
       const predicted = {
-        tmax: prev.daily.temperature_2m_max?.[idxPred] ?? null,
-        tmin: prev.daily.temperature_2m_min?.[idxPred] ?? null,
-        wind: prev.daily.windspeed_10m_max?.[idxPred] ?? null,
-        humidity: prev.daily.relative_humidity_2m_mean?.[idxPred] ?? null,
-        rain: prev.daily.rain_sum?.[idxPred] ?? null,
-        snow: prev.daily.snowfall_sum?.[idxPred] ?? null,
+        tmax: prev.daily.temperature_2m_max[idxPred],
+        wind: prev.daily.windspeed_10m_max[idxPred],
       };
 
       if (
@@ -142,47 +135,48 @@ export async function GET(req: Request) {
         actual.wind == null ||
         predicted.wind == null
       ) {
-        // Skip if we are missing key values
         continue;
       }
 
-      const deltas = {
-        tmax: predicted.tmax - actual.tmax,
-        tmin:
-          predicted.tmin != null && actual.tmin != null
-            ? predicted.tmin - actual.tmin
-            : null,
-        wind: predicted.wind - actual.wind,
-        humidity:
-          predicted.humidity != null && actual.humidity != null
-            ? predicted.humidity - actual.humidity
-            : null,
-        rain:
-          predicted.rain != null && actual.rain != null
-            ? predicted.rain - actual.rain
-            : null,
-        snow:
-          predicted.snow != null && actual.snow != null
-            ? predicted.snow - actual.snow
-            : null,
-      };
-
-      rows.push({ date, actual, predicted, deltas });
+      rows.push({
+        date,
+        actual,
+        predicted,
+        deltas: {
+          tmax: predicted.tmax - actual.tmax,
+          wind: predicted.wind - actual.wind,
+        },
+      });
     }
 
-    const valid = rows.filter((r) => r.deltas && typeof r.deltas.tmax === "number");
+    if (rows.length === 0) {
+      return NextResponse.json({
+        status: "insufficient-data",
+        horizon,
+        meta: {
+          tempUnit: "C",
+          windUnit: "km/h",
+          precipUnit: "mm",
+          humidityUnit: "%",
+        },
+        summary: { mae: null, bias: null, windMAE: null },
+        rows: [],
+      });
+    }
 
-    const mae = mean(valid.map((r) => Math.abs(r.deltas.tmax)));
-    const bias = mean(valid.map((r) => r.deltas.tmax as number));
-    const windMAE = mean(
-      valid
-        .filter((r) => typeof r.deltas.wind === "number")
-        .map((r) => Math.abs(r.deltas.wind as number))
-    );
+    const mae = mean(rows.map((r) => Math.abs(r.deltas.tmax)));
+    const bias = mean(rows.map((r) => r.deltas.tmax));
+    const windMAE = mean(rows.map((r) => Math.abs(r.deltas.wind)));
 
     return NextResponse.json({
+      status: "ok",
       horizon,
-      meta: { tempUnit: "C", windUnit: "km/h", precipUnit: "mm", humidityUnit: "%" },
+      meta: {
+        tempUnit: "C",
+        windUnit: "km/h",
+        precipUnit: "mm",
+        humidityUnit: "%",
+      },
       summary: { mae, bias, windMAE },
       rows,
     });
