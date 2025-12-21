@@ -24,16 +24,25 @@ export async function POST(req: Request) {
     const fallbackName = (name as string) || "";
     const cleanName = await normalizePlaceName(rl, rlo, fallbackName);
 
-    // Per-user key for their set of places
-    const placesKey = `twr:user:${userId}:places`;
+    const placeObject = {
+      name: cleanName,
+      lat: rl,
+      lon: rlo,
+    };
 
-    await redis.sadd(
-      placesKey,
-      JSON.stringify({ name: cleanName, lat: rl, lon: rlo })
-    );
+    // 1️⃣ Per-user key for their set of places
+    const userPlacesKey = `twr:user:${userId}:places`;
+
+    await redis.sadd(userPlacesKey, JSON.stringify(placeObject));
+
+    // 2️⃣ CRITICAL FIX:
+    // ALSO add to the global places set so the snapshot cron picks it up
+    // Do NOT stringify here — snapshot job expects objects
+    await redis.sadd("twr:places", placeObject);
 
     return new Response("ok");
   } catch (e: any) {
+    console.error("track route error:", e);
     return new Response(e?.message || "error", { status: 500 });
   }
 }
