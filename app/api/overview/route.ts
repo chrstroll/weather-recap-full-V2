@@ -26,6 +26,14 @@ type Snapshot = {
     relative_humidity_2m_mean: number[];
     windspeed_10m_max: number[];
   };
+  // NEW (optional for backwards compatibility with older snapshots)
+  yesterday?: {
+    tmax: number | null;
+    tmin: number | null;
+    rain: number | null;
+    snow: number | null;
+    wind: number | null;
+  } | null;
 };
 
 const STARTER_PLACES: Place[] = [
@@ -33,14 +41,43 @@ const STARTER_PLACES: Place[] = [
   { name: "London, England, United Kingdom", lat: 51.51, lon: -0.13 },
 ];
 
-async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | null> {
-  const today = new Date().toISOString().slice(0, 10);
-  const todayKey = `twr:snap:${today}:${lat},${lon}`;
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
+}
 
-  let snapJson = await redis.get(todayKey);
+function coercePlace(item: any): Place | null {
+  let obj: any = item;
+
+  if (typeof item === "string") {
+    try {
+      obj = JSON.parse(item);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!obj) return null;
+
+  const name = typeof obj.name === "string" ? obj.name.trim() : "";
+  const lat = Number(obj.lat);
+  const lon = Number(obj.lon);
+
+  if (!name || Number.isNaN(lat) || Number.isNaN(lon)) return null;
+
+  return { name, lat: round2(lat), lon: round2(lon) };
+}
+
+async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | null> {
+  const rl = round2(lat);
+  const rlo = round2(lon);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const todayKey = `twr:snap:${today}:${rl},${rlo}`;
+
+  let snapJson: any = await redis.get(todayKey);
 
   if (!snapJson) {
-    const indexKey = `twr:index:${lat},${lon}`;
+    const indexKey = `twr:index:${rl},${rlo}`;
     const keys = (await redis.smembers(indexKey)) as string[];
     if (!keys || keys.length === 0) return null;
 
@@ -50,35 +87,43 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
   }
 
   if (typeof snapJson === "string") {
-    return JSON.parse(snapJson) as Snapshot;
+    try {
+      return JSON.parse(snapJson) as Snapshot;
+    } catch {
+      return null;
+    }
   }
+
   return snapJson as Snapshot;
 }
 
 async function computeCompositeScore(lat: number, lon: number): Promise<number | null> {
   try {
-    const accuracyUrl = `https://weather-recap-full-v2.vercel.app/api/accuracy?lat=${lat}&lon=${lon}&horizon=1`;
+    const accuracyUrl =
+      `https://weather-recap-full-v2.vercel.app/api/accuracy` +
+      `?lat=${lat}&lon=${lon}&horizon=1`;
+
     const res = await fetch(accuracyUrl, { cache: "no-store" });
     if (!res.ok) return null;
 
     const data = await res.json();
 
-    // ✅ If accuracy is not ready, do NOT invent a perfect score
+    // If accuracy isn't ready, don't invent a score
     if (data?.status !== "ok" || !Array.isArray(data?.rows) || data.rows.length === 0) {
       return null;
     }
 
-    const tempMAE = typeof data.summary?.mae === "number" ? data.summary.mae : null;     // °C
+    const tempMAE = typeof data.summary?.mae === "number" ? data.summary.mae : null; // °C
     const windMAE = typeof data.summary?.windMAE === "number" ? data.summary.windMAE : null; // km/h
     if (tempMAE == null || windMAE == null) return null;
 
-    let precipErrors: number[] = [];
+    // Optional precip MAE from rows (rain deltas)
+    const precipErrors: number[] = [];
     for (const r of data.rows) {
       if (typeof r?.deltas?.rain === "number") {
         precipErrors.push(Math.abs(r.deltas.rain));
       }
     }
-
     const precipMAE =
       precipErrors.length > 0
         ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
@@ -104,17 +149,16 @@ export async function GET(req: Request) {
       return Response.json({ status: "missing-user-id", items: [] }, { status: 400 });
     }
 
-    // Track user globally so snapshot job can union all user places
+    // Track users globally so snapshot job can union per-user places
     await redis.sadd("twr:users", userId);
 
     const placesKey = `twr:user:${userId}:places`;
+
     let rawPlaces = (await redis.smembers(placesKey)) as any[];
 
     // Seed starter places if empty
     if (!rawPlaces || rawPlaces.length === 0) {
-      await Promise.all(
-        STARTER_PLACES.map((p) => redis.sadd(placesKey, JSON.stringify(p)))
-      );
+      await Promise.all(STARTER_PLACES.map((p) => redis.sadd(placesKey, JSON.stringify(p))));
       rawPlaces = (await redis.smembers(placesKey)) as any[];
     }
 
@@ -122,17 +166,16 @@ export async function GET(req: Request) {
       return Response.json({ status: "no-places", items: [] });
     }
 
-    // Parse JSON places
-    const places: Place[] = rawPlaces.map((p) =>
-      typeof p === "string" ? JSON.parse(p) : p
-    );
+    // Parse & normalize places (rounded coords)
+    const places = (rawPlaces || []).map(coercePlace).filter(Boolean) as Place[];
 
-    // Best-effort reconcile: ensure these places exist in legacy global set
-    // (safe/idempotent)
+    if (places.length === 0) {
+      return Response.json({ status: "no-places", items: [] });
+    }
+
+    // Ensure places are in global set in the same JSON-string format
     await Promise.all(
-      places.map((p) =>
-        redis.sadd("twr:places", { name: p.name, lat: p.lat, lon: p.lon })
-      )
+      places.map((p) => redis.sadd("twr:places", JSON.stringify(p)))
     );
 
     const today = new Date().toISOString().slice(0, 10);
@@ -141,9 +184,13 @@ export async function GET(req: Request) {
       places.map(async (place) => {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
-        // If no snapshot at all, we can’t score
         if (!snap) {
-          return { place, snapshotDate: today, score: null };
+          return {
+            place,
+            snapshotDate: today,
+            score: null,
+            yesterday: null,
+          };
         }
 
         const score = await computeCompositeScore(place.lat, place.lon);
@@ -151,7 +198,8 @@ export async function GET(req: Request) {
         return {
           place: snap.place,
           snapshotDate: snap.snapshotDate,
-          score, // number or null
+          score,
+          yesterday: snap.yesterday ?? null,
         };
       })
     );
