@@ -42,12 +42,13 @@ function indexForDate(daily: SnapshotDaily, date: string): number {
 
 const META = { tempUnit: "C", windUnit: "km/h", precipUnit: "mm", humidityUnit: "%" };
 
-function insufficient(horizon: number, message: string) {
-  // Backwards-compatible: keep numeric summary fields so Swift decoding never breaks
+function insufficient(horizon: number, window: number, message: string) {
+  // Keep numeric summary fields so Swift decoding never breaks
   return NextResponse.json({
     status: "insufficient-data",
     message,
     horizon,
+    window,
     meta: META,
     summary: { mae: 0, bias: 0, windMAE: 0 },
     rows: [],
@@ -59,16 +60,18 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const lat = parseFloat(searchParams.get("lat") || "");
     const lon = parseFloat(searchParams.get("lon") || "");
-    const horizon = Math.max(
-      1,
-      Math.min(5, parseInt(searchParams.get("horizon") || "1", 10))
-    );
+
+    // "horizon" = lead time (days)
+    const horizon = Math.max(1, Math.min(5, parseInt(searchParams.get("horizon") || "1", 10)));
+
+    // "window" = how many most-recent target days to return (apples-to-apples)
+    const window = Math.max(1, Math.min(14, parseInt(searchParams.get("window") || "5", 10)));
 
     if (Number.isNaN(lat) || Number.isNaN(lon)) {
       return NextResponse.json({ error: "Missing lat/lon" }, { status: 400 });
     }
 
-    // Match snapshot rounding
+    // Match snapshot rounding (same as the app)
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
 
@@ -76,7 +79,7 @@ export async function GET(req: Request) {
     const snapKeys = (await redis.smembers(indexKey)) as string[];
 
     if (!snapKeys || snapKeys.length === 0) {
-      return insufficient(horizon, "No snapshots found yet for this location.");
+      return insufficient(horizon, window, "No snapshots found yet for this location.");
     }
 
     // Load snapshots
@@ -92,6 +95,8 @@ export async function GET(req: Request) {
     snaps.sort((a, b) => (a.snapshotDate < b.snapshotDate ? -1 : 1));
 
     const rows: any[] = [];
+
+    // "today" as UTC date string (your snapshots are keyed by UTC YYYY-MM-DD too)
     const today = new Date().toISOString().slice(0, 10);
 
     for (let i = 0; i < snaps.length; i++) {
@@ -101,11 +106,12 @@ export async function GET(req: Request) {
 
       const prev = snaps[j];
 
+      // Require the snapshots to be exactly horizon days apart (handles missing days)
       if (dayDiff(current.snapshotDate, prev.snapshotDate) !== horizon) continue;
 
       const date = current.snapshotDate;
 
-      // Skip today; show up to yesterday
+      // Always skip today; return up to yesterday
       if (date === today) continue;
 
       const idxActual = indexForDate(current.daily, date);
@@ -130,33 +136,38 @@ export async function GET(req: Request) {
         snow: prev.daily.snowfall_sum?.[idxPred] ?? null,
       };
 
-      // Skip if missing key values
+      // Require at least key values so summaries don’t become junk
       if (actual.tmax == null || predicted.tmax == null || actual.wind == null || predicted.wind == null) {
         continue;
       }
 
       const deltas = {
         tmax: predicted.tmax - actual.tmax,
-        tmin:
-          predicted.tmin != null && actual.tmin != null ? predicted.tmin - actual.tmin : null,
+        tmin: predicted.tmin != null && actual.tmin != null ? predicted.tmin - actual.tmin : null,
         wind: predicted.wind - actual.wind,
         humidity:
           predicted.humidity != null && actual.humidity != null
             ? predicted.humidity - actual.humidity
             : null,
-        rain:
-          predicted.rain != null && actual.rain != null ? predicted.rain - actual.rain : null,
-        snow:
-          predicted.snow != null && actual.snow != null ? predicted.snow - actual.snow : null,
+        rain: predicted.rain != null && actual.rain != null ? predicted.rain - actual.rain : null,
+        snow: predicted.snow != null && actual.snow != null ? predicted.snow - actual.snow : null,
       };
 
       rows.push({ date, actual, predicted, deltas });
     }
 
-    const valid = rows.filter((r) => r.deltas && typeof r.deltas.tmax === "number");
+    // Sort by date ascending, then keep only the most recent "window" target dates
+    rows.sort((a, b) => (a.date < b.date ? -1 : 1));
+    const windowedRows = rows.slice(Math.max(0, rows.length - window));
+
+    const valid = windowedRows.filter((r) => r.deltas && typeof r.deltas.tmax === "number");
 
     if (valid.length === 0) {
-      return insufficient(horizon, "Not enough history yet to compute accuracy (need at least 2 days).");
+      return insufficient(
+        horizon,
+        window,
+        "Not enough history yet to compute accuracy (need at least 2 snapshots)."
+      );
     }
 
     const mae = mean(valid.map((r) => Math.abs(r.deltas.tmax)));
@@ -169,10 +180,11 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       status: "ok",
-      horizon,
+      horizon,     // lead time (days)
+      window,      // how many target days returned
       meta: META,
       summary: { mae, bias, windMAE },
-      rows,
+      rows: windowedRows,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
