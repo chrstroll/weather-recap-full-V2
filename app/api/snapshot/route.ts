@@ -19,6 +19,16 @@ type SnapshotDaily = {
   snowfall_sum: number[];
   relative_humidity_2m_mean: number[];
   windspeed_10m_max: number[];
+  winddirection_10m_dominant: number[]; // ✅ NEW
+};
+
+type YesterdayActuals = {
+  tmax: number | null;
+  tmin: number | null;
+  rain: number | null;
+  snow: number | null;
+  wind: number | null;
+  windDirDeg: number | null; // ✅ NEW
 };
 
 function round2(n: number) {
@@ -26,7 +36,6 @@ function round2(n: number) {
 }
 
 function placeKey(lat: number, lon: number) {
-  // Keep it consistent everywhere: 2 decimals
   const rl = round2(lat);
   const rlo = round2(lon);
   return `${rl},${rlo}`;
@@ -55,6 +64,7 @@ function coercePlace(item: any): Place | null {
 }
 
 async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
+  // ✅ include winddirection_10m_dominant so we can show wind direction in the hero
   const daily = [
     "temperature_2m_max",
     "temperature_2m_min",
@@ -62,6 +72,7 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
     "snowfall_sum",
     "relative_humidity_2m_mean",
     "windspeed_10m_max",
+    "winddirection_10m_dominant",
   ].join(",");
 
   const url =
@@ -78,12 +89,15 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
     throw new Error("open-meteo-missing-daily");
   }
 
+  // Minimal shape check so we fail loudly if upstream changes
+  if (!Array.isArray(d.windspeed_10m_max) || !Array.isArray(d.winddirection_10m_dominant)) {
+    throw new Error("open-meteo-missing-winddirection");
+  }
+
   return d as SnapshotDaily;
 }
 
-function extractYesterdayActuals(daily: SnapshotDaily) {
-  // Note: With forecast_days=7 starting today, yesterday often will NOT be present.
-  // That's okay: return null and the UI can show "—" until you later extend to past_days.
+function extractYesterdayActuals(daily: SnapshotDaily): YesterdayActuals | null {
   const yesterday = new Date();
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
   const yDate = yesterday.toISOString().slice(0, 10);
@@ -97,6 +111,7 @@ function extractYesterdayActuals(daily: SnapshotDaily) {
     rain: daily.rain_sum?.[idx] ?? null,
     snow: daily.snowfall_sum?.[idx] ?? null,
     wind: daily.windspeed_10m_max?.[idx] ?? null,
+    windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null, // ✅ NEW
   };
 }
 
@@ -104,9 +119,7 @@ export async function GET() {
   try {
     // 1) Legacy global set
     const rawGlobal = (await redis.smembers("twr:places")) as any[];
-    const globalPlaces = (rawGlobal || [])
-      .map(coercePlace)
-      .filter(Boolean) as Place[];
+    const globalPlaces = (rawGlobal || []).map(coercePlace).filter(Boolean) as Place[];
 
     // 2) Union in all per-user places (robust)
     const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
@@ -143,6 +156,7 @@ export async function GET() {
         const cleanName = await normalizePlaceName(lat, lon, name);
 
         const snapKey = `twr:snap:${today}:${lat},${lon}`;
+
         const payload = {
           place: { name: cleanName, lat, lon },
           snapshotDate: today,

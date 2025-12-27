@@ -25,14 +25,15 @@ type Snapshot = {
     snowfall_sum: number[];
     relative_humidity_2m_mean: number[];
     windspeed_10m_max: number[];
+    winddirection_10m_dominant?: number[]; // ✅ NEW (optional for old snapshots)
   };
-  // NEW (optional for backwards compatibility with older snapshots)
   yesterday?: {
     tmax: number | null;
     tmin: number | null;
     rain: number | null;
     snow: number | null;
     wind: number | null;
+    windDirDeg?: number | null; // ✅ NEW (optional for old snapshots)
   } | null;
 };
 
@@ -100,8 +101,7 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
 async function computeCompositeScore(lat: number, lon: number): Promise<number | null> {
   try {
     const accuracyUrl =
-      `https://weather-recap-full-v2.vercel.app/api/accuracy` +
-      `?lat=${lat}&lon=${lon}&horizon=1`;
+      `https://weather-recap-full-v2.vercel.app/api/accuracy` + `?lat=${lat}&lon=${lon}&horizon=1`;
 
     const res = await fetch(accuracyUrl, { cache: "no-store" });
     if (!res.ok) return null;
@@ -125,9 +125,7 @@ async function computeCompositeScore(lat: number, lon: number): Promise<number |
       }
     }
     const precipMAE =
-      precipErrors.length > 0
-        ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
-        : 0;
+      precipErrors.length > 0 ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length : 0;
 
     const tempScore = Math.max(0, 100 - tempMAE * 10);
     const windScore = Math.max(0, 100 - windMAE * 2);
@@ -174,9 +172,7 @@ export async function GET(req: Request) {
     }
 
     // Ensure places are in global set in the same JSON-string format
-    await Promise.all(
-      places.map((p) => redis.sadd("twr:places", JSON.stringify(p)))
-    );
+    await Promise.all(places.map((p) => redis.sadd("twr:places", JSON.stringify(p))));
 
     const today = new Date().toISOString().slice(0, 10);
 
@@ -199,6 +195,7 @@ export async function GET(req: Request) {
           place: snap.place,
           snapshotDate: snap.snapshotDate,
           score,
+          // ✅ this now includes windDirDeg when available
           yesterday: snap.yesterday ?? null,
         };
       })
@@ -206,9 +203,6 @@ export async function GET(req: Request) {
 
     return Response.json({ status: "ok", items });
   } catch (e: any) {
-    return Response.json(
-      { status: "error", detail: String(e?.message || e) },
-      { status: 500 }
-    );
+    return Response.json({ status: "error", detail: String(e?.message || e) }, { status: 500 });
   }
 }
