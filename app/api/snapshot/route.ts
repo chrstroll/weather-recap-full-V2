@@ -19,16 +19,8 @@ type SnapshotDaily = {
   snowfall_sum: number[];
   relative_humidity_2m_mean: number[];
   windspeed_10m_max: number[];
-  winddirection_10m_dominant: number[]; // ✅ NEW
-};
-
-type YesterdayActuals = {
-  tmax: number | null;
-  tmin: number | null;
-  rain: number | null;
-  snow: number | null;
-  wind: number | null;
-  windDirDeg: number | null; // ✅ NEW
+  // ✅ ADD wind direction in daily
+  winddirection_10m_dominant: number[];
 };
 
 function round2(n: number) {
@@ -64,7 +56,7 @@ function coercePlace(item: any): Place | null {
 }
 
 async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
-  // ✅ include winddirection_10m_dominant so we can show wind direction in the hero
+  // ✅ INCLUDE winddirection_10m_dominant
   const daily = [
     "temperature_2m_max",
     "temperature_2m_min",
@@ -79,8 +71,20 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
     `&past_days=1&forecast_days=7&daily=${daily}&timezone=auto`;
 
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error("open-meteo-upstream");
+  const res = await fetch(url, {
+    cache: "no-store",
+    headers: {
+      // helps with some edge proxy behaviors; harmless otherwise
+      "User-Agent": "WeatherRecap/1.0 (+vercel)",
+      "Accept": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    // include a short snippet so you can debug 429/5xx/etc from logs
+    throw new Error(`open-meteo-upstream:${res.status}:${text.slice(0, 200)}`);
+  }
 
   const json = await res.json();
   const d = json?.daily;
@@ -89,15 +93,10 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
     throw new Error("open-meteo-missing-daily");
   }
 
-  // Minimal shape check so we fail loudly if upstream changes
-  if (!Array.isArray(d.windspeed_10m_max) || !Array.isArray(d.winddirection_10m_dominant)) {
-    throw new Error("open-meteo-missing-winddirection");
-  }
-
   return d as SnapshotDaily;
 }
 
-function extractYesterdayActuals(daily: SnapshotDaily): YesterdayActuals | null {
+function extractYesterdayActuals(daily: SnapshotDaily) {
   const yesterday = new Date();
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
   const yDate = yesterday.toISOString().slice(0, 10);
@@ -111,7 +110,8 @@ function extractYesterdayActuals(daily: SnapshotDaily): YesterdayActuals | null 
     rain: daily.rain_sum?.[idx] ?? null,
     snow: daily.snowfall_sum?.[idx] ?? null,
     wind: daily.windspeed_10m_max?.[idx] ?? null,
-    windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null, // ✅ NEW
+    // ✅ NEW
+    windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null,
   };
 }
 
@@ -119,9 +119,11 @@ export async function GET() {
   try {
     // 1) Legacy global set
     const rawGlobal = (await redis.smembers("twr:places")) as any[];
-    const globalPlaces = (rawGlobal || []).map(coercePlace).filter(Boolean) as Place[];
+    const globalPlaces = (rawGlobal || [])
+      .map(coercePlace)
+      .filter(Boolean) as Place[];
 
-    // 2) Union in all per-user places (robust)
+    // 2) Union in all per-user places
     const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
 
     const userPlacesArrays = await Promise.all(
@@ -133,7 +135,7 @@ export async function GET() {
 
     const allPlaces = [...globalPlaces, ...userPlacesArrays.flat()];
 
-    // 3) De-dupe by canonical (rounded) coords
+    // 3) De-dupe by rounded coords
     const map = new Map<string, Place>();
     for (const p of allPlaces) {
       map.set(placeKey(p.lat, p.lon), { name: p.name, lat: round2(p.lat), lon: round2(p.lon) });
@@ -146,30 +148,47 @@ export async function GET() {
 
     const today = new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
 
-    await Promise.all(
+    // ✅ Make snapshot robust: do NOT fail whole run if one place fails upstream
+    const results = await Promise.all(
       places.map(async (place) => {
         const { name, lat, lon } = place;
+        try {
+          const daily = await fetchDaily(lat, lon);
 
-        const daily = await fetchDaily(lat, lon);
+          const cleanName = await normalizePlaceName(lat, lon, name);
 
-        // Normalize display name
-        const cleanName = await normalizePlaceName(lat, lon, name);
+          const snapKey = `twr:snap:${today}:${lat},${lon}`;
+          const payload = {
+            place: { name: cleanName, lat, lon },
+            snapshotDate: today,
+            daily,
+            yesterday: extractYesterdayActuals(daily),
+          };
 
-        const snapKey = `twr:snap:${today}:${lat},${lon}`;
+          await redis.set(snapKey, JSON.stringify(payload), { ex: 60 * 60 * 24 * 120 });
+          await redis.sadd(`twr:index:${lat},${lon}`, snapKey);
 
-        const payload = {
-          place: { name: cleanName, lat, lon },
-          snapshotDate: today,
-          daily,
-          yesterday: extractYesterdayActuals(daily),
-        };
-
-        await redis.set(snapKey, JSON.stringify(payload), { ex: 60 * 60 * 24 * 120 });
-        await redis.sadd(`twr:index:${lat},${lon}`, snapKey);
+          return { ok: true, lat, lon, key: snapKey };
+        } catch (e: any) {
+          return {
+            ok: false,
+            lat,
+            lon,
+            error: String(e?.message || e),
+          };
+        }
       })
     );
 
-    return Response.json({ status: "snapshotted-redis", count: places.length });
+    const okCount = results.filter((r) => r.ok).length;
+    const fail = results.filter((r) => !r.ok);
+
+    return Response.json({
+      status: fail.length ? "snapshotted-partial" : "snapshotted-redis",
+      count: okCount,
+      failedCount: fail.length,
+      failed: fail.slice(0, 25), // keep response bounded
+    });
   } catch (e: any) {
     console.error("snapshot route error:", e);
     return Response.json(

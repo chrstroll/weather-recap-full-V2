@@ -25,7 +25,9 @@ type Snapshot = {
     snowfall_sum: number[];
     relative_humidity_2m_mean: number[];
     windspeed_10m_max: number[];
-    winddirection_10m_dominant?: number[]; // ✅ NEW (optional for old snapshots)
+    // ✅ If you ever need it later, snapshot now stores winddirection_10m_dominant in daily too,
+    // but overview only needs yesterday.windDirDeg for the hero line.
+    winddirection_10m_dominant?: number[];
   };
   yesterday?: {
     tmax: number | null;
@@ -33,7 +35,8 @@ type Snapshot = {
     rain: number | null;
     snow: number | null;
     wind: number | null;
-    windDirDeg?: number | null; // ✅ NEW (optional for old snapshots)
+    // ✅ NEW
+    windDirDeg?: number | null;
   } | null;
 };
 
@@ -101,14 +104,14 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
 async function computeCompositeScore(lat: number, lon: number): Promise<number | null> {
   try {
     const accuracyUrl =
-      `https://weather-recap-full-v2.vercel.app/api/accuracy` + `?lat=${lat}&lon=${lon}&horizon=1`;
+      `https://weather-recap-full-v2.vercel.app/api/accuracy` +
+      `?lat=${lat}&lon=${lon}&horizon=1`;
 
     const res = await fetch(accuracyUrl, { cache: "no-store" });
     if (!res.ok) return null;
 
     const data = await res.json();
 
-    // If accuracy isn't ready, don't invent a score
     if (data?.status !== "ok" || !Array.isArray(data?.rows) || data.rows.length === 0) {
       return null;
     }
@@ -117,15 +120,14 @@ async function computeCompositeScore(lat: number, lon: number): Promise<number |
     const windMAE = typeof data.summary?.windMAE === "number" ? data.summary.windMAE : null; // km/h
     if (tempMAE == null || windMAE == null) return null;
 
-    // Optional precip MAE from rows (rain deltas)
     const precipErrors: number[] = [];
     for (const r of data.rows) {
-      if (typeof r?.deltas?.rain === "number") {
-        precipErrors.push(Math.abs(r.deltas.rain));
-      }
+      if (typeof r?.deltas?.rain === "number") precipErrors.push(Math.abs(r.deltas.rain));
     }
     const precipMAE =
-      precipErrors.length > 0 ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length : 0;
+      precipErrors.length > 0
+        ? precipErrors.reduce((a, b) => a + b, 0) / precipErrors.length
+        : 0;
 
     const tempScore = Math.max(0, 100 - tempMAE * 10);
     const windScore = Math.max(0, 100 - windMAE * 2);
@@ -147,14 +149,11 @@ export async function GET(req: Request) {
       return Response.json({ status: "missing-user-id", items: [] }, { status: 400 });
     }
 
-    // Track users globally so snapshot job can union per-user places
     await redis.sadd("twr:users", userId);
 
     const placesKey = `twr:user:${userId}:places`;
-
     let rawPlaces = (await redis.smembers(placesKey)) as any[];
 
-    // Seed starter places if empty
     if (!rawPlaces || rawPlaces.length === 0) {
       await Promise.all(STARTER_PLACES.map((p) => redis.sadd(placesKey, JSON.stringify(p))));
       rawPlaces = (await redis.smembers(placesKey)) as any[];
@@ -164,14 +163,12 @@ export async function GET(req: Request) {
       return Response.json({ status: "no-places", items: [] });
     }
 
-    // Parse & normalize places (rounded coords)
     const places = (rawPlaces || []).map(coercePlace).filter(Boolean) as Place[];
 
     if (places.length === 0) {
       return Response.json({ status: "no-places", items: [] });
     }
 
-    // Ensure places are in global set in the same JSON-string format
     await Promise.all(places.map((p) => redis.sadd("twr:places", JSON.stringify(p))));
 
     const today = new Date().toISOString().slice(0, 10);
@@ -181,12 +178,7 @@ export async function GET(req: Request) {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
         if (!snap) {
-          return {
-            place,
-            snapshotDate: today,
-            score: null,
-            yesterday: null,
-          };
+          return { place, snapshotDate: today, score: null, yesterday: null };
         }
 
         const score = await computeCompositeScore(place.lat, place.lon);
@@ -195,14 +187,16 @@ export async function GET(req: Request) {
           place: snap.place,
           snapshotDate: snap.snapshotDate,
           score,
-          // ✅ this now includes windDirDeg when available
-          yesterday: snap.yesterday ?? null,
+          yesterday: snap.yesterday ?? null, // ✅ now includes windDirDeg when snapshot has it
         };
       })
     );
 
     return Response.json({ status: "ok", items });
   } catch (e: any) {
-    return Response.json({ status: "error", detail: String(e?.message || e) }, { status: 500 });
+    return Response.json(
+      { status: "error", detail: String(e?.message || e) },
+      { status: 500 }
+    );
   }
 }
