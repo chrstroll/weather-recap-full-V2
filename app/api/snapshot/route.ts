@@ -15,11 +15,20 @@ type SnapshotDaily = {
   time: string[];
   temperature_2m_max: number[];
   temperature_2m_min: number[];
+
+  // ✅ Keep existing (liquid-only) for backwards compatibility + debugging
   rain_sum: number[];
+
+  // ✅ NEW: total water (rain + showers + snow water-equivalent)
+  precipitation_sum: number[];
+
+  // ✅ snow amount
   snowfall_sum: number[];
+
   relative_humidity_2m_mean: number[];
   windspeed_10m_max: number[];
-  // ✅ ADD wind direction in daily
+
+  // ✅ wind direction
   winddirection_10m_dominant: number[];
 };
 
@@ -56,11 +65,17 @@ function coercePlace(item: any): Place | null {
 }
 
 async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
-  // ✅ INCLUDE winddirection_10m_dominant
+  // ✅ INCLUDE precipitation_sum + winddirection_10m_dominant
   const daily = [
     "temperature_2m_max",
     "temperature_2m_min",
+
+    // total water
+    "precipitation_sum",
+
+    // keep liquid-only rain too
     "rain_sum",
+
     "snowfall_sum",
     "relative_humidity_2m_mean",
     "windspeed_10m_max",
@@ -74,15 +89,13 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
   const res = await fetch(url, {
     cache: "no-store",
     headers: {
-      // helps with some edge proxy behaviors; harmless otherwise
       "User-Agent": "WeatherRecap/1.0 (+vercel)",
-      "Accept": "application/json",
+      Accept: "application/json",
     },
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    // include a short snippet so you can debug 429/5xx/etc from logs
     throw new Error(`open-meteo-upstream:${res.status}:${text.slice(0, 200)}`);
   }
 
@@ -107,10 +120,17 @@ function extractYesterdayActuals(daily: SnapshotDaily) {
   return {
     tmax: daily.temperature_2m_max?.[idx] ?? null,
     tmin: daily.temperature_2m_min?.[idx] ?? null,
+
+    // ✅ NEW canonical "wetness" metric
+    precip: daily.precipitation_sum?.[idx] ?? null,
+
+    // ✅ keep for compatibility + debugging
     rain: daily.rain_sum?.[idx] ?? null,
+
     snow: daily.snowfall_sum?.[idx] ?? null,
     wind: daily.windspeed_10m_max?.[idx] ?? null,
-    // ✅ NEW
+
+    // wind direction
     windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null,
   };
 }
@@ -119,9 +139,7 @@ export async function GET() {
   try {
     // 1) Legacy global set
     const rawGlobal = (await redis.smembers("twr:places")) as any[];
-    const globalPlaces = (rawGlobal || [])
-      .map(coercePlace)
-      .filter(Boolean) as Place[];
+    const globalPlaces = (rawGlobal || []).map(coercePlace).filter(Boolean) as Place[];
 
     // 2) Union in all per-user places
     const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
@@ -148,13 +166,12 @@ export async function GET() {
 
     const today = new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
 
-    // ✅ Make snapshot robust: do NOT fail whole run if one place fails upstream
+    // ✅ Robust: don't fail whole run if one place fails
     const results = await Promise.all(
       places.map(async (place) => {
         const { name, lat, lon } = place;
         try {
           const daily = await fetchDaily(lat, lon);
-
           const cleanName = await normalizePlaceName(lat, lon, name);
 
           const snapKey = `twr:snap:${today}:${lat},${lon}`;
@@ -170,12 +187,7 @@ export async function GET() {
 
           return { ok: true, lat, lon, key: snapKey };
         } catch (e: any) {
-          return {
-            ok: false,
-            lat,
-            lon,
-            error: String(e?.message || e),
-          };
+          return { ok: false, lat, lon, error: String(e?.message || e) };
         }
       })
     );
@@ -187,7 +199,7 @@ export async function GET() {
       status: fail.length ? "snapshotted-partial" : "snapshotted-redis",
       count: okCount,
       failedCount: fail.length,
-      failed: fail.slice(0, 25), // keep response bounded
+      failed: fail.slice(0, 25),
     });
   } catch (e: any) {
     console.error("snapshot route error:", e);
