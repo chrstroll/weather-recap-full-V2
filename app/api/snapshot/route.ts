@@ -84,7 +84,7 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
 
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    `&past_days=1&forecast_days=7&daily=${daily}&timezone=auto`;
+    `&past_days=1&forecast_days=7&daily=${daily}&timezone=auto&models=ecmwf_ifs`;
 
   const res = await fetch(url, {
     cache: "no-store",
