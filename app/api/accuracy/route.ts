@@ -9,14 +9,33 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
+/**
+ * IMPORTANT:
+ * - This route compares TWO snapshots:
+ *   current snapshot provides "actuals" for that date,
+ *   prior snapshot (horizon days earlier) provides "predicted" for that same date.
+ *
+ * - Precipitation in Open-Meteo can be bucketed as rain vs showers vs snow.
+ *   To avoid "it rained but rain_sum == 0" cases, we compute TOTAL PRECIP:
+ *     precip = precipitation_sum
+ *       OR (rain_sum + showers_sum)
+ *       OR rain_sum (fallback for older snapshots)
+ */
+
 type SnapshotDaily = {
   time: string[];
   temperature_2m_max: number[];
   temperature_2m_min: number[];
   windspeed_10m_max: number[];
   relative_humidity_2m_mean: number[];
-  rain_sum: number[];
-  snowfall_sum: number[];
+
+  // legacy fields (existing snapshots)
+  rain_sum?: number[];
+  snowfall_sum?: number[];
+
+  // new preferred fields (after you update snapshot job)
+  precipitation_sum?: number[];
+  showers_sum?: number[];
 };
 
 type Snapshot = {
@@ -40,7 +59,34 @@ function indexForDate(daily: SnapshotDaily, date: string): number {
   return daily.time?.findIndex((t) => t === date) ?? -1;
 }
 
-const META = { tempUnit: "C", windUnit: "km/h", precipUnit: "mm", humidityUnit: "%" };
+function numAt(arr: number[] | undefined, idx: number): number | null {
+  if (!arr) return null;
+  const v = arr[idx];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function precipAt(daily: SnapshotDaily, idx: number): number | null {
+  // Prefer total precip if the snapshot stored it
+  const p = numAt(daily.precipitation_sum, idx);
+  if (p != null) return p;
+
+  // Otherwise, rain + showers if available
+  const r = numAt(daily.rain_sum, idx);
+  const sh = numAt(daily.showers_sum, idx);
+  if (r != null && sh != null) return r + sh;
+
+  // Fallback to rain only (older snapshots)
+  if (r != null) return r;
+
+  return null;
+}
+
+const META = {
+  tempUnit: "C",
+  windUnit: "km/h",
+  precipUnit: "mm",
+  humidityUnit: "%",
+};
 
 function insufficient(horizon: number, window: number, message: string) {
   // Keep numeric summary fields so Swift decoding never breaks
@@ -64,7 +110,7 @@ export async function GET(req: Request) {
     // "horizon" = lead time (days)
     const horizon = Math.max(1, Math.min(5, parseInt(searchParams.get("horizon") || "1", 10)));
 
-    // "window" = how many most-recent target days to return (apples-to-apples)
+    // "window" = how many most-recent target days to return
     const window = Math.max(1, Math.min(14, parseInt(searchParams.get("window") || "5", 10)));
 
     if (Number.isNaN(lat) || Number.isNaN(lon)) {
@@ -87,8 +133,7 @@ export async function GET(req: Request) {
     for (const key of snapKeys) {
       const raw = await redis.get(key);
       if (!raw) continue;
-      const snap =
-        typeof raw === "string" ? (JSON.parse(raw) as Snapshot) : (raw as Snapshot);
+      const snap = typeof raw === "string" ? (JSON.parse(raw) as Snapshot) : (raw as Snapshot);
       if (snap?.snapshotDate && snap.daily?.time) snaps.push(snap);
     }
 
@@ -96,7 +141,7 @@ export async function GET(req: Request) {
 
     const rows: any[] = [];
 
-    // "today" as UTC date string (your snapshots are keyed by UTC YYYY-MM-DD too)
+    // today as UTC date string (snapshots keyed by UTC YYYY-MM-DD)
     const today = new Date().toISOString().slice(0, 10);
 
     for (let i = 0; i < snaps.length; i++) {
@@ -106,12 +151,12 @@ export async function GET(req: Request) {
 
       const prev = snaps[j];
 
-      // Require the snapshots to be exactly horizon days apart (handles missing days)
+      // Require snapshots exactly horizon days apart (handles missing days)
       if (dayDiff(current.snapshotDate, prev.snapshotDate) !== horizon) continue;
 
       const date = current.snapshotDate;
 
-      // Always skip today; return up to yesterday
+      // Skip today (need completed day)
       if (date === today) continue;
 
       const idxActual = indexForDate(current.daily, date);
@@ -119,24 +164,28 @@ export async function GET(req: Request) {
       if (idxActual < 0 || idxPred < 0) continue;
 
       const actual = {
-        tmax: current.daily.temperature_2m_max?.[idxActual] ?? null,
-        tmin: current.daily.temperature_2m_min?.[idxActual] ?? null,
-        wind: current.daily.windspeed_10m_max?.[idxActual] ?? null,
-        humidity: current.daily.relative_humidity_2m_mean?.[idxActual] ?? null,
-        rain: current.daily.rain_sum?.[idxActual] ?? null,
-        snow: current.daily.snowfall_sum?.[idxActual] ?? null,
+        tmax: numAt(current.daily.temperature_2m_max, idxActual),
+        tmin: numAt(current.daily.temperature_2m_min, idxActual),
+        wind: numAt(current.daily.windspeed_10m_max, idxActual),
+        humidity: numAt(current.daily.relative_humidity_2m_mean as any, idxActual),
+        // legacy fields still exposed
+        rain: numAt(current.daily.rain_sum, idxActual),
+        snow: numAt(current.daily.snowfall_sum, idxActual),
+        // NEW: total precip (for consistency)
+        precip: precipAt(current.daily, idxActual),
       };
 
       const predicted = {
-        tmax: prev.daily.temperature_2m_max?.[idxPred] ?? null,
-        tmin: prev.daily.temperature_2m_min?.[idxPred] ?? null,
-        wind: prev.daily.windspeed_10m_max?.[idxPred] ?? null,
-        humidity: prev.daily.relative_humidity_2m_mean?.[idxPred] ?? null,
-        rain: prev.daily.rain_sum?.[idxPred] ?? null,
-        snow: prev.daily.snowfall_sum?.[idxPred] ?? null,
+        tmax: numAt(prev.daily.temperature_2m_max, idxPred),
+        tmin: numAt(prev.daily.temperature_2m_min, idxPred),
+        wind: numAt(prev.daily.windspeed_10m_max, idxPred),
+        humidity: numAt(prev.daily.relative_humidity_2m_mean as any, idxPred),
+        rain: numAt(prev.daily.rain_sum, idxPred),
+        snow: numAt(prev.daily.snowfall_sum, idxPred),
+        precip: precipAt(prev.daily, idxPred),
       };
 
-      // Require at least key values so summaries don’t become junk
+      // Require at least key values
       if (actual.tmax == null || predicted.tmax == null || actual.wind == null || predicted.wind == null) {
         continue;
       }
@@ -151,23 +200,22 @@ export async function GET(req: Request) {
             : null,
         rain: predicted.rain != null && actual.rain != null ? predicted.rain - actual.rain : null,
         snow: predicted.snow != null && actual.snow != null ? predicted.snow - actual.snow : null,
+        // NEW: total precip delta
+        precip:
+          predicted.precip != null && actual.precip != null ? predicted.precip - actual.precip : null,
       };
 
       rows.push({ date, actual, predicted, deltas });
     }
 
-    // Sort by date ascending, then keep only the most recent "window" target dates
+    // Sort ascending, keep only most recent "window"
     rows.sort((a, b) => (a.date < b.date ? -1 : 1));
     const windowedRows = rows.slice(Math.max(0, rows.length - window));
 
     const valid = windowedRows.filter((r) => r.deltas && typeof r.deltas.tmax === "number");
 
     if (valid.length === 0) {
-      return insufficient(
-        horizon,
-        window,
-        "Not enough history yet to compute accuracy (need at least 2 snapshots)."
-      );
+      return insufficient(horizon, window, "Not enough history yet to compute accuracy (need at least 2 snapshots).");
     }
 
     const mae = mean(valid.map((r) => Math.abs(r.deltas.tmax)));
@@ -180,8 +228,8 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       status: "ok",
-      horizon,     // lead time (days)
-      window,      // how many target days returned
+      horizon,
+      window,
       meta: META,
       summary: { mae, bias, windMAE },
       rows: windowedRows,
