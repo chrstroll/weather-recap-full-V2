@@ -1,9 +1,9 @@
 # Privacy Policy – The Weather Recap
 
-**Last updated: December 7, 2025**
+**Last updated: December 28, 2025**
 
 This Privacy Policy describes how The Weather Recap (“the App”) handles information when you use it.
-The App is published by Claret Bioscience, Inc. (“we”, “us”, or “our”).
+The App is published by The Weather Recap Inc. (“we”, “us”, or “our”).
 
 ## 1. Data we collect
 
@@ -70,8 +70,8 @@ We may update this Privacy Policy from time to time. When we do, we will update 
 
 If you have any questions about this Privacy Policy or about the App, you can contact:
 
-Claret Bioscience, Inc.  
-Email: support@claretbio.com  
+The WeatherRecap
+Email: theweatherrecap@gmail.com  
 Subject line: “The Weather Recap – Privacy”
 
 ## Support
