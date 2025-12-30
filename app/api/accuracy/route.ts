@@ -20,6 +20,10 @@ const redis = new Redis({
  *     precip = precipitation_sum
  *       OR (rain_sum + showers_sum)
  *       OR rain_sum (fallback for older snapshots)
+ *
+ * - CRITICAL FIX:
+ *   "Today" must be determined in the LOCATION'S TIMEZONE, not UTC.
+ *   Otherwise late-day local time (e.g., PST evening) can include today's partial actuals.
  */
 
 type SnapshotDaily = {
@@ -101,6 +105,40 @@ function insufficient(horizon: number, window: number, message: string) {
   });
 }
 
+/**
+ * Fetch the IANA timezone name for the given lat/lon.
+ * We keep this lightweight; we only need `timezone` back from Open-Meteo.
+ */
+async function fetchTimeZone(lat: number, lon: number): Promise<string> {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `&forecast_days=1&daily=temperature_2m_max&timezone=auto`;
+
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`open-meteo-timezone-upstream:${res.status}:${text.slice(0, 120)}`);
+  }
+
+  const json = await res.json();
+  const tz = json?.timezone;
+  if (typeof tz !== "string" || !tz.length) throw new Error("open-meteo-missing-timezone");
+  return tz;
+}
+
+/**
+ * Returns YYYY-MM-DD for "now" in the given IANA timezone.
+ * Using `en-CA` yields a stable YYYY-MM-DD format.
+ */
+function ymdInTimeZone(date: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -120,6 +158,18 @@ export async function GET(req: Request) {
     // Match snapshot rounding (same as the app)
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
+
+    // ✅ Determine "today" in the LOCATION'S timezone (not UTC)
+    // This prevents including partial local-day "actuals".
+    let localToday = "";
+    try {
+      const tz = await fetchTimeZone(rl, rlo);
+      localToday = ymdInTimeZone(new Date(), tz);
+    } catch {
+      // If timezone lookup fails, fall back to UTC (better than 500).
+      // This reverts to old behavior but only in rare upstream failures.
+      localToday = new Date().toISOString().slice(0, 10);
+    }
 
     const indexKey = `twr:index:${rl},${rlo}`;
     const snapKeys = (await redis.smembers(indexKey)) as string[];
@@ -141,9 +191,6 @@ export async function GET(req: Request) {
 
     const rows: any[] = [];
 
-    // today as UTC date string (snapshots keyed by UTC YYYY-MM-DD)
-    const today = new Date().toISOString().slice(0, 10);
-
     for (let i = 0; i < snaps.length; i++) {
       const current = snaps[i];
       const j = i - horizon;
@@ -156,8 +203,8 @@ export async function GET(req: Request) {
 
       const date = current.snapshotDate;
 
-      // Skip today (need completed day)
-      if (date === today) continue;
+      // ✅ Skip incomplete days: local "today" and any future dates
+      if (date >= localToday) continue;
 
       const idxActual = indexForDate(current.daily, date);
       const idxPred = indexForDate(prev.daily, date);
@@ -168,10 +215,12 @@ export async function GET(req: Request) {
         tmin: numAt(current.daily.temperature_2m_min, idxActual),
         wind: numAt(current.daily.windspeed_10m_max, idxActual),
         humidity: numAt(current.daily.relative_humidity_2m_mean as any, idxActual),
+
         // legacy fields still exposed
         rain: numAt(current.daily.rain_sum, idxActual),
         snow: numAt(current.daily.snowfall_sum, idxActual),
-        // NEW: total precip (for consistency)
+
+        // total precip (for consistency)
         precip: precipAt(current.daily, idxActual),
       };
 
@@ -180,6 +229,7 @@ export async function GET(req: Request) {
         tmin: numAt(prev.daily.temperature_2m_min, idxPred),
         wind: numAt(prev.daily.windspeed_10m_max, idxPred),
         humidity: numAt(prev.daily.relative_humidity_2m_mean as any, idxPred),
+
         rain: numAt(prev.daily.rain_sum, idxPred),
         snow: numAt(prev.daily.snowfall_sum, idxPred),
         precip: precipAt(prev.daily, idxPred),
@@ -198,11 +248,11 @@ export async function GET(req: Request) {
           predicted.humidity != null && actual.humidity != null
             ? predicted.humidity - actual.humidity
             : null,
+
         rain: predicted.rain != null && actual.rain != null ? predicted.rain - actual.rain : null,
         snow: predicted.snow != null && actual.snow != null ? predicted.snow - actual.snow : null,
-        // NEW: total precip delta
-        precip:
-          predicted.precip != null && actual.precip != null ? predicted.precip - actual.precip : null,
+
+        precip: predicted.precip != null && actual.precip != null ? predicted.precip - actual.precip : null,
       };
 
       rows.push({ date, actual, predicted, deltas });
@@ -215,7 +265,11 @@ export async function GET(req: Request) {
     const valid = windowedRows.filter((r) => r.deltas && typeof r.deltas.tmax === "number");
 
     if (valid.length === 0) {
-      return insufficient(horizon, window, "Not enough history yet to compute accuracy (need at least 2 snapshots).");
+      return insufficient(
+        horizon,
+        window,
+        "Not enough history yet to compute accuracy (need at least 2 snapshots)."
+      );
     }
 
     const mae = mean(valid.map((r) => Math.abs(r.deltas.tmax)));
