@@ -10,20 +10,28 @@ const redis = new Redis({
 });
 
 /**
- * IMPORTANT:
- * - This route compares TWO snapshots:
- *   current snapshot provides "actuals" for that date,
- *   prior snapshot (horizon days earlier) provides "predicted" for that same date.
+ * IMPORTANT (v2 logic):
+ * - We compare TWO snapshots, but we shift the target day by 1:
  *
- * - Precipitation in Open-Meteo can be bucketed as rain vs showers vs snow.
- *   To avoid "it rained but rain_sum == 0" cases, we compute TOTAL PRECIP:
+ *   For a target day D (e.g., "yesterday"), we use:
+ *     - ACTUALS from snapshot taken on D+1 (more "settled" daily aggregates)
+ *     - PREDICTED from snapshot taken on (D - horizon)
+ *
+ *   In snapshot-index terms:
+ *     current = snaps[i]           // snapshotDate = D+1
+ *     prev    = snaps[i-(h+1)]     // snapshotDate = D-horizon
+ *     target  = current.snapshotDate - 1 day = D
+ *
+ * - This reduces mismatch where the "same day" daily aggregates can still drift.
+ *
+ * - Precipitation can be bucketed as rain vs showers vs snow water-equivalent.
+ *   We compute TOTAL PRECIP:
  *     precip = precipitation_sum
  *       OR (rain_sum + showers_sum)
  *       OR rain_sum (fallback for older snapshots)
  *
- * - CRITICAL FIX:
+ * - CRITICAL:
  *   "Today" must be determined in the LOCATION'S TIMEZONE, not UTC.
- *   Otherwise late-day local time (e.g., PST evening) can include today's partial actuals.
  */
 
 type SnapshotDaily = {
@@ -37,16 +45,35 @@ type SnapshotDaily = {
   rain_sum?: number[];
   snowfall_sum?: number[];
 
-  // new preferred fields (after you update snapshot job)
+  // new preferred fields (after snapshot job update)
   precipitation_sum?: number[];
   showers_sum?: number[];
 };
 
 type Snapshot = {
   place: { name: string; lat: number; lon: number };
-  snapshotDate: string; // YYYY-MM-DD
+  snapshotDate: string; // YYYY-MM-DD (your snapshot job uses UTC date here)
   daily: SnapshotDaily;
 };
+
+const META = {
+  tempUnit: "C",
+  windUnit: "km/h",
+  precipUnit: "mm",
+  humidityUnit: "%",
+};
+
+function insufficient(horizon: number, window: number, message: string) {
+  return NextResponse.json({
+    status: "insufficient-data",
+    message,
+    horizon,
+    window,
+    meta: META,
+    summary: { mae: 0, bias: 0, windMAE: 0 },
+    rows: [],
+  });
+}
 
 function mean(values: number[]): number {
   if (!values.length) return 0;
@@ -57,6 +84,12 @@ function dayDiff(a: string, b: string): number {
   const toDate = (s: string) => new Date(s + "T00:00:00Z").getTime();
   const diffMs = toDate(a) - toDate(b);
   return Math.round(diffMs / (24 * 60 * 60 * 1000));
+}
+
+function addDaysUTC(ymd: string, deltaDays: number): string {
+  const t = new Date(ymd + "T00:00:00Z").getTime();
+  const out = new Date(t + deltaDays * 24 * 60 * 60 * 1000);
+  return out.toISOString().slice(0, 10);
 }
 
 function indexForDate(daily: SnapshotDaily, date: string): number {
@@ -70,44 +103,20 @@ function numAt(arr: number[] | undefined, idx: number): number | null {
 }
 
 function precipAt(daily: SnapshotDaily, idx: number): number | null {
-  // Prefer total precip if the snapshot stored it
   const p = numAt(daily.precipitation_sum, idx);
   if (p != null) return p;
 
-  // Otherwise, rain + showers if available
   const r = numAt(daily.rain_sum, idx);
   const sh = numAt(daily.showers_sum, idx);
   if (r != null && sh != null) return r + sh;
 
-  // Fallback to rain only (older snapshots)
   if (r != null) return r;
-
   return null;
-}
-
-const META = {
-  tempUnit: "C",
-  windUnit: "km/h",
-  precipUnit: "mm",
-  humidityUnit: "%",
-};
-
-function insufficient(horizon: number, window: number, message: string) {
-  // Keep numeric summary fields so Swift decoding never breaks
-  return NextResponse.json({
-    status: "insufficient-data",
-    message,
-    horizon,
-    window,
-    meta: META,
-    summary: { mae: 0, bias: 0, windMAE: 0 },
-    rows: [],
-  });
 }
 
 /**
  * Fetch the IANA timezone name for the given lat/lon.
- * We keep this lightweight; we only need `timezone` back from Open-Meteo.
+ * Lightweight: only needs `timezone` from Open-Meteo.
  */
 async function fetchTimeZone(lat: number, lon: number): Promise<string> {
   const url =
@@ -128,7 +137,7 @@ async function fetchTimeZone(lat: number, lon: number): Promise<string> {
 
 /**
  * Returns YYYY-MM-DD for "now" in the given IANA timezone.
- * Using `en-CA` yields a stable YYYY-MM-DD format.
+ * Using `en-CA` yields stable YYYY-MM-DD.
  */
 function ymdInTimeZone(date: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-CA", {
@@ -145,10 +154,7 @@ export async function GET(req: Request) {
     const lat = parseFloat(searchParams.get("lat") || "");
     const lon = parseFloat(searchParams.get("lon") || "");
 
-    // "horizon" = lead time (days)
     const horizon = Math.max(1, Math.min(5, parseInt(searchParams.get("horizon") || "1", 10)));
-
-    // "window" = how many most-recent target days to return
     const window = Math.max(1, Math.min(14, parseInt(searchParams.get("window") || "5", 10)));
 
     if (Number.isNaN(lat) || Number.isNaN(lon)) {
@@ -160,14 +166,11 @@ export async function GET(req: Request) {
     const rlo = Math.round(lon * 100) / 100;
 
     // ✅ Determine "today" in the LOCATION'S timezone (not UTC)
-    // This prevents including partial local-day "actuals".
     let localToday = "";
     try {
       const tz = await fetchTimeZone(rl, rlo);
       localToday = ymdInTimeZone(new Date(), tz);
     } catch {
-      // If timezone lookup fails, fall back to UTC (better than 500).
-      // This reverts to old behavior but only in rare upstream failures.
       localToday = new Date().toISOString().slice(0, 10);
     }
 
@@ -191,23 +194,31 @@ export async function GET(req: Request) {
 
     const rows: any[] = [];
 
+    // ✅ NEW: use D+1 snapshot for actuals.
+    // current.snapshotDate = D+1
+    // targetDate = D = current.snapshotDate - 1
+    // prev.snapshotDate should be (horizon+1) days behind current so that its forecast contains D at lead time "horizon".
+    const requiredGap = horizon + 1;
+
     for (let i = 0; i < snaps.length; i++) {
       const current = snaps[i];
-      const j = i - horizon;
-      if (j < 0) continue;
 
-      const prev = snaps[j];
+      const prevIndex = i - requiredGap;
+      if (prevIndex < 0) continue;
 
-      // Require snapshots exactly horizon days apart (handles missing days)
-      if (dayDiff(current.snapshotDate, prev.snapshotDate) !== horizon) continue;
+      const prev = snaps[prevIndex];
 
-      const date = current.snapshotDate;
+      // Require snapshots exactly (horizon+1) days apart (handles missing days)
+      if (dayDiff(current.snapshotDate, prev.snapshotDate) !== requiredGap) continue;
+
+      const targetDate = addDaysUTC(current.snapshotDate, -1);
 
       // ✅ Skip incomplete days: local "today" and any future dates
-      if (date >= localToday) continue;
+      // (targetDate is the day we’re scoring)
+      if (targetDate >= localToday) continue;
 
-      const idxActual = indexForDate(current.daily, date);
-      const idxPred = indexForDate(prev.daily, date);
+      const idxActual = indexForDate(current.daily, targetDate);
+      const idxPred = indexForDate(prev.daily, targetDate);
       if (idxActual < 0 || idxPred < 0) continue;
 
       const actual = {
@@ -220,7 +231,7 @@ export async function GET(req: Request) {
         rain: numAt(current.daily.rain_sum, idxActual),
         snow: numAt(current.daily.snowfall_sum, idxActual),
 
-        // total precip (for consistency)
+        // total precip (canonical)
         precip: precipAt(current.daily, idxActual),
       };
 
@@ -236,7 +247,12 @@ export async function GET(req: Request) {
       };
 
       // Require at least key values
-      if (actual.tmax == null || predicted.tmax == null || actual.wind == null || predicted.wind == null) {
+      if (
+        actual.tmax == null ||
+        predicted.tmax == null ||
+        actual.wind == null ||
+        predicted.wind == null
+      ) {
         continue;
       }
 
@@ -252,10 +268,11 @@ export async function GET(req: Request) {
         rain: predicted.rain != null && actual.rain != null ? predicted.rain - actual.rain : null,
         snow: predicted.snow != null && actual.snow != null ? predicted.snow - actual.snow : null,
 
-        precip: predicted.precip != null && actual.precip != null ? predicted.precip - actual.precip : null,
+        precip:
+          predicted.precip != null && actual.precip != null ? predicted.precip - actual.precip : null,
       };
 
-      rows.push({ date, actual, predicted, deltas });
+      rows.push({ date: targetDate, actual, predicted, deltas });
     }
 
     // Sort ascending, keep only most recent "window"
