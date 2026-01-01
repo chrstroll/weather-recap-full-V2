@@ -2,11 +2,7 @@
   "crons": [
     {
       "path": "/api/snapshot/dispatch",
-      "schedule": "5 0 * * *"
-    },
-    {
-      "path": "/api/snapshot/worker?batch=25&concurrency=3",
-      "schedule": "*/5 * * * *"
+      "schedule": "5 8 * * *"
     }
   ]
 }
