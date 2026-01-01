@@ -16,19 +16,19 @@ type SnapshotDaily = {
   temperature_2m_max: number[];
   temperature_2m_min: number[];
 
-  // ✅ Keep existing (liquid-only) for backwards compatibility + debugging
+  // Keep existing (liquid-only) for backwards compatibility + debugging
   rain_sum: number[];
 
-  // ✅ NEW: total water (rain + showers + snow water-equivalent)
+  // Total water
   precipitation_sum: number[];
 
-  // ✅ snow amount
+  // Snow amount
   snowfall_sum: number[];
 
   relative_humidity_2m_mean: number[];
   windspeed_10m_max: number[];
 
-  // ✅ wind direction
+  // Wind direction
   winddirection_10m_dominant: number[];
 };
 
@@ -65,17 +65,11 @@ function coercePlace(item: any): Place | null {
 }
 
 async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
-  // ✅ INCLUDE precipitation_sum + winddirection_10m_dominant
   const daily = [
     "temperature_2m_max",
     "temperature_2m_min",
-
-    // total water
     "precipitation_sum",
-
-    // keep liquid-only rain too
     "rain_sum",
-
     "snowfall_sum",
     "relative_humidity_2m_mean",
     "windspeed_10m_max",
@@ -110,6 +104,8 @@ async function fetchDaily(lat: number, lon: number): Promise<SnapshotDaily> {
 }
 
 function extractYesterdayActuals(daily: SnapshotDaily) {
+  // NOTE: This uses UTC day boundaries (matches snapshotDate = UTC).
+  // That is OK as long as overview/accuracy logic consistently use snapshotDate/day keys.
   const yesterday = new Date();
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
   const yDate = yesterday.toISOString().slice(0, 10);
@@ -121,18 +117,60 @@ function extractYesterdayActuals(daily: SnapshotDaily) {
     tmax: daily.temperature_2m_max?.[idx] ?? null,
     tmin: daily.temperature_2m_min?.[idx] ?? null,
 
-    // ✅ NEW canonical "wetness" metric
+    // Canonical wetness
     precip: daily.precipitation_sum?.[idx] ?? null,
 
-    // ✅ keep for compatibility + debugging
+    // Keep liquid-only for compatibility/debugging
     rain: daily.rain_sum?.[idx] ?? null,
 
     snow: daily.snowfall_sum?.[idx] ?? null,
     wind: daily.windspeed_10m_max?.[idx] ?? null,
 
-    // wind direction
     windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null,
   };
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryable(errMsg: string) {
+  // retry 429 throttles + transient fetch failures
+  return (
+    errMsg.includes("open-meteo-upstream:429") ||
+    errMsg.toLowerCase().includes("fetch failed") ||
+    errMsg.toLowerCase().includes("network") ||
+    errMsg.toLowerCase().includes("timeout")
+  );
+}
+
+async function fetchDailyWithRetry(lat: number, lon: number, maxAttempts = 3): Promise<SnapshotDaily> {
+  let lastErr: any = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fetchDaily(lat, lon);
+    } catch (e: any) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+
+      const retry = attempt < maxAttempts && isRetryable(msg);
+      if (!retry) break;
+
+      // Exponential backoff + small jitter
+      const base = 350 * Math.pow(2, attempt - 1); // 350ms, 700ms, 1400ms...
+      const jitter = Math.floor(Math.random() * 150);
+      await sleep(base + jitter);
+    }
+  }
+
+  throw lastErr;
+}
+
+function chunk<T>(arr: T[], size: number) {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
 export async function GET() {
@@ -166,31 +204,45 @@ export async function GET() {
 
     const today = new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
 
-    // ✅ Robust: don't fail whole run if one place fails
-    const results = await Promise.all(
-      places.map(async (place) => {
-        const { name, lat, lon } = place;
-        try {
-          const daily = await fetchDaily(lat, lon);
-          const cleanName = await normalizePlaceName(lat, lon, name);
+    // ---- THROTTLE CONTROL ----
+    // Keep this modest to avoid Open-Meteo 429s.
+    // 8–12 is usually safe; you can tune later.
+    const CONCURRENCY = 10;
 
-          const snapKey = `twr:snap:${today}:${lat},${lon}`;
-          const payload = {
-            place: { name: cleanName, lat, lon },
-            snapshotDate: today,
-            daily,
-            yesterday: extractYesterdayActuals(daily),
-          };
+    const results: any[] = [];
+    const batches = chunk(places, CONCURRENCY);
 
-          await redis.set(snapKey, JSON.stringify(payload), { ex: 60 * 60 * 24 * 120 });
-          await redis.sadd(`twr:index:${lat},${lon}`, snapKey);
+    for (const batch of batches) {
+      const batchResults = await Promise.all(
+        batch.map(async (place) => {
+          const { name, lat, lon } = place;
+          try {
+            const daily = await fetchDailyWithRetry(lat, lon, 3);
+            const cleanName = await normalizePlaceName(lat, lon, name);
 
-          return { ok: true, lat, lon, key: snapKey };
-        } catch (e: any) {
-          return { ok: false, lat, lon, error: String(e?.message || e) };
-        }
-      })
-    );
+            const snapKey = `twr:snap:${today}:${lat},${lon}`;
+            const payload = {
+              place: { name: cleanName, lat, lon },
+              snapshotDate: today,
+              daily,
+              yesterday: extractYesterdayActuals(daily),
+            };
+
+            await redis.set(snapKey, JSON.stringify(payload), { ex: 60 * 60 * 24 * 120 });
+            await redis.sadd(`twr:index:${lat},${lon}`, snapKey);
+
+            return { ok: true, lat, lon, key: snapKey };
+          } catch (e: any) {
+            return { ok: false, lat, lon, error: String(e?.message || e) };
+          }
+        })
+      );
+
+      results.push(...batchResults);
+
+      // Small gap between batches helps prevent “bursty” throttling.
+      await sleep(150);
+    }
 
     const okCount = results.filter((r) => r.ok).length;
     const fail = results.filter((r) => !r.ok);
@@ -199,7 +251,7 @@ export async function GET() {
       status: fail.length ? "snapshotted-partial" : "snapshotted-redis",
       count: okCount,
       failedCount: fail.length,
-      failed: fail.slice(0, 25),
+      failed: fail.slice(0, 50),
     });
   } catch (e: any) {
     console.error("snapshot route error:", e);
