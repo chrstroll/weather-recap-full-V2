@@ -10,11 +10,19 @@ const redis = new Redis({
 });
 
 type Place = { name: string; lat: number; lon: number };
+type QueueItem = { name: string; lat: number; lon: number };
+
+const TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
 function coercePlace(item: any): Place | null {
   let obj: any = item;
+
   if (typeof item === "string") {
-    try { obj = JSON.parse(item); } catch { return null; }
+    try {
+      obj = JSON.parse(item);
+    } catch {
+      return null;
+    }
   }
   if (!obj) return null;
 
@@ -22,16 +30,34 @@ function coercePlace(item: any): Place | null {
   const lon = Number(obj.lon);
   if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
 
-  return { name: String(obj.name || ""), lat: round2(lat), lon: round2(lon) };
+  const name =
+    typeof obj.name === "string" ? obj.name.trim() : String(obj.name || "").trim();
+  if (!name) return null;
+
+  return { name, lat: round2(lat), lon: round2(lon) };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const url = new URL(req.url);
 
-    const queueKey = `twr:snap:queue:${today}`;
-    const enqSet = `twr:snap:enqueued:${today}`;
-    const statsKey = `twr:snap:stats:${today}`;
+    // Drain settings (tunable from query string)
+    const batch = Math.max(1, Math.min(200, parseInt(url.searchParams.get("batch") || "25", 10)));
+    const concurrency = Math.max(1, Math.min(8, parseInt(url.searchParams.get("concurrency") || "3", 10)));
+    const maxBatches = Math.max(1, Math.min(250, parseInt(url.searchParams.get("maxBatches") || "40", 10)));
+
+    const todayUTC = new Date().toISOString().slice(0, 10);
+
+    const queueKey = `twr:snap:queue:${todayUTC}`;
+    const enqSetKey = `twr:snap:enqueued:${todayUTC}`;
+    const statsKey = `twr:snap:stats:${todayUTC}`;
+
+    // Ensure daily keys don't live forever
+    await Promise.all([
+      redis.expire(queueKey, TTL_SECONDS),
+      redis.expire(enqSetKey, TTL_SECONDS),
+      redis.expire(statsKey, TTL_SECONDS),
+    ]);
 
     // Build pinned-only list: union all twr:user:<uid>:places
     const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
@@ -45,37 +71,97 @@ export async function GET() {
 
     const all = perUser.flat();
 
-    // Dedup by rounded coords
-    const uniq = new Map<string, { lat: number; lon: number }>();
+    // Dedup by rounded coords; keep a "best" name (prefer longer/more specific)
+    const uniq = new Map<string, QueueItem>();
     for (const p of all) {
-      uniq.set(placeKey(p.lat, p.lon), { lat: round2(p.lat), lon: round2(p.lon) });
+      const rl = round2(p.lat);
+      const rlo = round2(p.lon);
+      const k = placeKey(rl, rlo);
+
+      const existing = uniq.get(k);
+      if (!existing) {
+        uniq.set(k, { name: p.name, lat: rl, lon: rlo });
+      } else {
+        const cur = (existing.name || "").trim();
+        const next = (p.name || "").trim();
+        if (next.length > cur.length) {
+          uniq.set(k, { name: next, lat: rl, lon: rlo });
+        }
+      }
     }
 
     const places = [...uniq.values()];
 
     let enqueued = 0;
+
+    // Enqueue sequentially (gentler on Redis)
     for (const p of places) {
-      const key = placeKey(p.lat, p.lon);
+      const k = placeKey(p.lat, p.lon);
+
       // SADD returns 1 if new
-      const added = await redis.sadd(enqSet, key);
-      if (added) {
-        await redis.rpush(queueKey, JSON.stringify({ lat: p.lat, lon: p.lon }));
-        enqueued++;
-      }
+      const added = await redis.sadd(enqSetKey, k);
+      if (!added) continue;
+
+      await redis.rpush(queueKey, JSON.stringify(p));
+      enqueued++;
     }
 
-    await redis.hincrby(statsKey, "enqueued", enqueued);
-    await redis.hset(statsKey, { lastDispatchAt: new Date().toISOString() });
+    await Promise.all([
+      redis.hincrby(statsKey, "enqueued", enqueued),
+      redis.hset(statsKey, { lastDispatchAt: new Date().toISOString() }),
+    ]);
+
+    // --- CRITICAL FIX (free-plan safe): drain the queue by calling worker repeatedly ---
+    const origin = new URL(req.url).origin;
+
+    let drainedBatches = 0;
+    let drainedOk = 0;
+    let drainedFail = 0;
+    let lastWorker: any = null;
+
+    for (let i = 0; i < maxBatches; i++) {
+      const workerURL =
+        `${origin}/api/snapshot/worker?batch=${batch}&concurrency=${concurrency}&_=${Date.now()}`;
+
+      const res = await fetch(workerURL, { cache: "no-store" });
+      const json = await res.json();
+      lastWorker = json;
+
+      // Worker returns {status:"empty"} when queue is empty
+      if (json?.status === "empty") break;
+
+      drainedBatches++;
+      drainedOk += Number(json?.okCount || 0);
+      drainedFail += Number(json?.failCount || 0);
+
+      // Safety: if worker didn't pop anything, stop
+      if (Number(json?.batchSize || 0) === 0) break;
+    }
+
+    await redis.hset(statsKey, { lastDrainAt: new Date().toISOString() });
 
     return Response.json({
       status: "ok",
-      date: today,
+      dateUTC: todayUTC,
       users: userIds.length,
       uniquePinnedPlaces: places.length,
       newlyEnqueued: enqueued,
       queueKey,
+      ttlSeconds: TTL_SECONDS,
+      drain: {
+        batch,
+        concurrency,
+        maxBatches,
+        drainedBatches,
+        drainedOk,
+        drainedFail,
+        lastWorkerSample: lastWorker,
+      },
     });
   } catch (e: any) {
-    return Response.json({ status: "error", detail: String(e?.message || e) }, { status: 500 });
+    return Response.json(
+      { status: "error", detail: String(e?.message || e) },
+      { status: 500 }
+    );
   }
 }
