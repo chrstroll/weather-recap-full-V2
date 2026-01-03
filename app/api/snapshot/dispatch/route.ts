@@ -1,6 +1,7 @@
 // app/api/snapshot/dispatch/route.ts
 import { Redis } from "@upstash/redis";
-import { placeKey, round2 } from "../../../../lib/snapshotUtils";
+import { normalizePlaceName } from "../../../../lib/normalizePlace";
+import { placeKey, round2, mapWithConcurrency, withRetry } from "../../../../lib/snapshotUtils";
 
 export const dynamic = "force-dynamic";
 
@@ -9,154 +10,176 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-type Place = { name: string; lat: number; lon: number };
-type QueueItem = { name: string; lat: number; lon: number };
+type Place = { name?: string; lat: number; lon: number };
+
+type SnapshotDaily = {
+  time: string[];
+  temperature_2m_max: number[];
+  temperature_2m_min: number[];
+  precipitation_sum: number[];
+  rain_sum: number[];
+  snowfall_sum: number[];
+  relative_humidity_2m_mean: number[];
+  windspeed_10m_max: number[];
+  winddirection_10m_dominant: number[];
+};
 
 const TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const MAX_PLACES_PER_RUN = 150;      // hard safety cap (free plan)
+const CONCURRENCY = 3;               // safe for Open-Meteo free tier
+
+/* ---------------- helpers ---------------- */
 
 function coercePlace(item: any): Place | null {
-  let obj: any = item;
+  try {
+    const obj = typeof item === "string" ? JSON.parse(item) : item;
+    const lat = Number(obj?.lat);
+    const lon = Number(obj?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
-  if (typeof item === "string") {
-    try {
-      obj = JSON.parse(item);
-    } catch {
-      return null;
-    }
+    const name = typeof obj?.name === "string" ? obj.name.trim() : undefined;
+    return { name, lat: round2(lat), lon: round2(lon) };
+  } catch {
+    return null;
   }
-  if (!obj) return null;
-
-  const lat = Number(obj.lat);
-  const lon = Number(obj.lon);
-  if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
-
-  const name =
-    typeof obj.name === "string" ? obj.name.trim() : String(obj.name || "").trim();
-  if (!name) return null;
-
-  return { name, lat: round2(lat), lon: round2(lon) };
 }
 
-export async function GET(req: Request) {
+async function fetchDaily(lat: number, lon: number): Promise<{ timezone: string; daily: SnapshotDaily }> {
+  const daily = [
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "precipitation_sum",
+    "rain_sum",
+    "snowfall_sum",
+    "relative_humidity_2m_mean",
+    "windspeed_10m_max",
+    "winddirection_10m_dominant",
+  ].join(",");
+
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `&past_days=1&forecast_days=7&daily=${daily}&timezone=auto&models=ecmwf_ifs`;
+
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`open-meteo ${res.status}`);
+  const json = await res.json();
+
+  if (!json?.daily?.time || !json?.timezone) {
+    throw new Error("open-meteo malformed response");
+  }
+
+  return { timezone: json.timezone, daily: json.daily as SnapshotDaily };
+}
+
+function ymdInTZ(d: Date, tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+function extractYesterday(daily: SnapshotDaily, tz: string) {
+  const todayLocal = ymdInTZ(new Date(), tz);
+  const t = new Date(todayLocal + "T00:00:00Z").getTime();
+  const yesterday = new Date(t - 86400000).toISOString().slice(0, 10);
+
+  const idx = daily.time.findIndex((d) => d === yesterday);
+  if (idx < 0) return null;
+
+  return {
+    tmax: daily.temperature_2m_max[idx] ?? null,
+    tmin: daily.temperature_2m_min[idx] ?? null,
+    precip: daily.precipitation_sum[idx] ?? null,
+    rain: daily.rain_sum[idx] ?? null,
+    snow: daily.snowfall_sum[idx] ?? null,
+    wind: daily.windspeed_10m_max[idx] ?? null,
+    windDirDeg: daily.winddirection_10m_dominant[idx] ?? null,
+    localYesterday: yesterday,
+    timeZone: tz,
+  };
+}
+
+/* ---------------- main ---------------- */
+
+export async function GET() {
   try {
-    const url = new URL(req.url);
-
-    // Drain settings (tunable from query string)
-    const batch = Math.max(1, Math.min(200, parseInt(url.searchParams.get("batch") || "25", 10)));
-    const concurrency = Math.max(1, Math.min(8, parseInt(url.searchParams.get("concurrency") || "3", 10)));
-    const maxBatches = Math.max(1, Math.min(250, parseInt(url.searchParams.get("maxBatches") || "40", 10)));
-
     const todayUTC = new Date().toISOString().slice(0, 10);
 
-    const queueKey = `twr:snap:queue:${todayUTC}`;
-    const enqSetKey = `twr:snap:enqueued:${todayUTC}`;
     const statsKey = `twr:snap:stats:${todayUTC}`;
+    await redis.expire(statsKey, TTL_SECONDS);
 
-    // Ensure daily keys don't live forever
-    await Promise.all([
-      redis.expire(queueKey, TTL_SECONDS),
-      redis.expire(enqSetKey, TTL_SECONDS),
-      redis.expire(statsKey, TTL_SECONDS),
-    ]);
-
-    // Build pinned-only list: union all twr:user:<uid>:places
-    const userIds = ((await redis.smembers("twr:users")) as string[]) || [];
+    /* 1️⃣ Collect pinned places (pinned only) */
+    const userIds = (await redis.smembers("twr:users")) as string[];
 
     const perUser = await Promise.all(
       userIds.map(async (uid) => {
-        const raw = (await redis.smembers(`twr:user:${uid}:places`)) as any[];
+        const raw = await redis.smembers(`twr:user:${uid}:places`);
         return (raw || []).map(coercePlace).filter(Boolean) as Place[];
       })
     );
 
-    const all = perUser.flat();
-
-    // Dedup by rounded coords; keep a "best" name (prefer longer/more specific)
-    const uniq = new Map<string, QueueItem>();
-    for (const p of all) {
-      const rl = round2(p.lat);
-      const rlo = round2(p.lon);
-      const k = placeKey(rl, rlo);
-
-      const existing = uniq.get(k);
-      if (!existing) {
-        uniq.set(k, { name: p.name, lat: rl, lon: rlo });
-      } else {
-        const cur = (existing.name || "").trim();
-        const next = (p.name || "").trim();
-        if (next.length > cur.length) {
-          uniq.set(k, { name: next, lat: rl, lon: rlo });
-        }
-      }
+    /* 2️⃣ Deduplicate by rounded coords */
+    const uniq = new Map<string, Place>();
+    for (const p of perUser.flat()) {
+      const k = placeKey(p.lat, p.lon);
+      if (!uniq.has(k)) uniq.set(k, p);
     }
 
-    const places = [...uniq.values()];
+    const places = [...uniq.values()].slice(0, MAX_PLACES_PER_RUN);
 
-    let enqueued = 0;
+    /* 3️⃣ Snapshot sequentially with bounded concurrency */
+    let ok = 0;
+    let fail = 0;
 
-    // Enqueue sequentially (gentler on Redis)
-    for (const p of places) {
+    await mapWithConcurrency(places, CONCURRENCY, async (p) => {
       const k = placeKey(p.lat, p.lon);
 
-      // SADD returns 1 if new
-      const added = await redis.sadd(enqSetKey, k);
-      if (!added) continue;
+      try {
+        const { timezone, daily } = await withRetry(
+          () => fetchDaily(p.lat, p.lon),
+          { retries: 3, baseDelayMs: 400 }
+        );
 
-      await redis.rpush(queueKey, JSON.stringify(p));
-      enqueued++;
-    }
+        const payload = {
+          place: {
+            name: await normalizePlaceName(p.lat, p.lon, p.name || ""),
+            lat: p.lat,
+            lon: p.lon,
+          },
+          snapshotDate: todayUTC,   // canonical index date
+          localToday: ymdInTZ(new Date(), timezone),
+          timezone,
+          daily,
+          yesterday: extractYesterday(daily, timezone),
+        };
 
-    await Promise.all([
-      redis.hincrby(statsKey, "enqueued", enqueued),
-      redis.hset(statsKey, { lastDispatchAt: new Date().toISOString() }),
-    ]);
+        const snapKey = `twr:snap:${todayUTC}:${p.lat},${p.lon}`;
+        await redis.set(snapKey, JSON.stringify(payload), { ex: 60 * 60 * 24 * 120 });
+        await redis.sadd(`twr:index:${p.lat},${p.lon}`, snapKey);
 
-    // --- CRITICAL FIX (free-plan safe): drain the queue by calling worker repeatedly ---
-    const origin = new URL(req.url).origin;
+        ok++;
+      } catch {
+        fail++;
+      }
+    });
 
-    let drainedBatches = 0;
-    let drainedOk = 0;
-    let drainedFail = 0;
-    let lastWorker: any = null;
-
-    for (let i = 0; i < maxBatches; i++) {
-      const workerURL =
-        `${origin}/api/snapshot/worker?batch=${batch}&concurrency=${concurrency}&_=${Date.now()}`;
-
-      const res = await fetch(workerURL, { cache: "no-store" });
-      const json = await res.json();
-      lastWorker = json;
-
-      // Worker returns {status:"empty"} when queue is empty
-      if (json?.status === "empty") break;
-
-      drainedBatches++;
-      drainedOk += Number(json?.okCount || 0);
-      drainedFail += Number(json?.failCount || 0);
-
-      // Safety: if worker didn't pop anything, stop
-      if (Number(json?.batchSize || 0) === 0) break;
-    }
-
-    await redis.hset(statsKey, { lastDrainAt: new Date().toISOString() });
+    await redis.hset(statsKey, {
+      ok,
+      fail,
+      total: places.length,
+      lastRunAt: new Date().toISOString(),
+    });
 
     return Response.json({
       status: "ok",
       dateUTC: todayUTC,
       users: userIds.length,
       uniquePinnedPlaces: places.length,
-      newlyEnqueued: enqueued,
-      queueKey,
-      ttlSeconds: TTL_SECONDS,
-      drain: {
-        batch,
-        concurrency,
-        maxBatches,
-        drainedBatches,
-        drainedOk,
-        drainedFail,
-        lastWorkerSample: lastWorker,
-      },
+      ok,
+      fail,
+      cappedAt: MAX_PLACES_PER_RUN,
     });
   } catch (e: any) {
     return Response.json(
