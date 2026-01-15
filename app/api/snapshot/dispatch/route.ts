@@ -25,7 +25,7 @@ type SnapshotDaily = {
 };
 
 const TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
-const MAX_PLACES_PER_RUN = 200;      // hard safety cap (free plan)
+const MAX_PLACES_PER_RUN = 300;      // hard safety cap (free plan)
 const CONCURRENCY = 3;               // safe for Open-Meteo free tier
 
 /* ---------------- helpers ---------------- */
