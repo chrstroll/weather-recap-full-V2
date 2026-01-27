@@ -81,34 +81,22 @@ function ymdInTZ(d: Date, tz: string): string {
 }
 
 function extractYesterday(daily: SnapshotDaily, tz: string) {
-  // Find "today" in the daily.time array (which is in the same timezone as `tz`).
-  // If found, take the previous element as yesterday. If not found, fallback to
-  // computing yesterday's yyyy-mm-dd in tz and searching for that string.
   const todayLocal = ymdInTZ(new Date(), tz);
+  const t = new Date(todayLocal + "T00:00:00Z").getTime();
+  const yesterday = new Date(t - 86400000).toISOString().slice(0, 10);
 
-  // prefer locating today in the array and using prior index — avoids TZ arithmetic issues
-  const todayIdx = daily.time.findIndex((d) => d === todayLocal);
-  let idx = -1;
-
-  if (todayIdx > 0) {
-    idx = todayIdx - 1;
-  } else {
-    // fallback: compute yesterday in the same timezone and look for it
-    const yesterdayLocal = ymdInTZ(new Date(Date.now() - 86400000), tz);
-    idx = daily.time.findIndex((d) => d === yesterdayLocal);
-  }
-
+  const idx = daily.time.findIndex((d) => d === yesterday);
   if (idx < 0) return null;
 
   return {
     tmax: daily.temperature_2m_max[idx] ?? null,
     tmin: daily.temperature_2m_min[idx] ?? null,
-    precip: (daily.precipitation_sum as any)?.[idx] ?? null,
-    rain: (daily.rain_sum as any)?.[idx] ?? null,
-    snow: (daily.snowfall_sum as any)?.[idx] ?? null,
-    wind: (daily.windspeed_10m_max as any)?.[idx] ?? null,
-    windDirDeg: (daily.winddirection_10m_dominant as any)?.[idx] ?? null,
-    localYesterday: daily.time[idx],
+    precip: daily.precipitation_sum[idx] ?? null,
+    rain: daily.rain_sum[idx] ?? null,
+    snow: daily.snowfall_sum[idx] ?? null,
+    wind: daily.windspeed_10m_max[idx] ?? null,
+    windDirDeg: daily.winddirection_10m_dominant[idx] ?? null,
+    localYesterday: yesterday,
     timeZone: tz,
   };
 }
