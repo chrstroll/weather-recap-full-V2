@@ -101,81 +101,6 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
   return snapJson as Snapshot;
 }
 
-/* ---------------- NEW: Open-Meteo fallback for "yesterday" (landing page) ---------------- */
-
-type SnapshotDailyFallback = {
-  time: string[];
-  temperature_2m_max: number[];
-  temperature_2m_min: number[];
-  precipitation_sum?: number[];
-  rain_sum?: number[];
-  snowfall_sum?: number[];
-  relative_humidity_2m_mean?: number[];
-  windspeed_10m_max?: number[];
-  winddirection_10m_dominant?: number[];
-};
-
-async function fetchDailyFallback(lat: number, lon: number): Promise<{ timezone: string; daily: SnapshotDailyFallback }> {
-  const daily = [
-    "temperature_2m_max",
-    "temperature_2m_min",
-    "precipitation_sum",
-    "rain_sum",
-    "snowfall_sum",
-    "relative_humidity_2m_mean",
-    "windspeed_10m_max",
-    "winddirection_10m_dominant",
-  ].join(",");
-
-  const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    `&past_days=1&forecast_days=7&daily=${daily}&timezone=auto&models=ecmwf_ifs`;
-
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`open-meteo ${res.status}`);
-  const json = await res.json();
-
-  if (!json?.daily?.time || !json?.timezone) {
-    throw new Error("open-meteo malformed response");
-  }
-
-  return { timezone: json.timezone as string, daily: json.daily as SnapshotDailyFallback };
-}
-
-function ymdInTZ(d: Date, tz: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(d);
-}
-
-function extractYesterdayFallback(daily: SnapshotDailyFallback, tz: string) {
-  const todayLocal = ymdInTZ(new Date(), tz);
-  const t = new Date(todayLocal + "T00:00:00Z").getTime();
-  const yesterday = new Date(t - 86400000).toISOString().slice(0, 10);
-
-  const idx = daily.time.findIndex((d) => d === yesterday);
-  if (idx < 0) return null;
-
-  // NOTE: This object is for the landing page card.
-  // It mirrors snapshot/dispatch behavior but does not write a snapshot.
-  return {
-    tmax: daily.temperature_2m_max?.[idx] ?? null,
-    tmin: daily.temperature_2m_min?.[idx] ?? null,
-    precip: daily.precipitation_sum?.[idx] ?? null,
-    rain: daily.rain_sum?.[idx] ?? null,
-    snow: daily.snowfall_sum?.[idx] ?? null,
-    wind: daily.windspeed_10m_max?.[idx] ?? null,
-    windDirDeg: daily.winddirection_10m_dominant?.[idx] ?? null,
-    localYesterday: yesterday,
-    timeZone: tz,
-  };
-}
-
-/* ---------------- existing score logic ---------------- */
-
 async function computeCompositeScore(lat: number, lon: number): Promise<number | null> {
   try {
     const accuracyUrl =
@@ -253,27 +178,7 @@ export async function GET(req: Request) {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
         if (!snap) {
-          // ✅ NEW: provide "yesterday" immediately for brand new places (no snapshot yet)
-          // Cache it briefly to avoid repeated Open-Meteo calls while user scrolls/reloads.
-          const cacheKey = `twr:overview:yesterday:${place.lat},${place.lon}`;
-
-          try {
-            const cached: any = await redis.get(cacheKey);
-            if (cached) {
-              const y = typeof cached === "string" ? JSON.parse(cached) : cached;
-              return { place, snapshotDate: today, score: null, yesterday: y ?? null };
-            }
-
-            const { timezone, daily } = await fetchDailyFallback(place.lat, place.lon);
-            const y = extractYesterdayFallback(daily, timezone);
-
-            // cache for 3 hours (tweak if you want)
-            await redis.set(cacheKey, JSON.stringify(y ?? null), { ex: 60 * 60 * 3 });
-
-            return { place, snapshotDate: today, score: null, yesterday: y ?? null };
-          } catch {
-            return { place, snapshotDate: today, score: null, yesterday: null };
-          }
+          return { place, snapshotDate: today, score: null, yesterday: null };
         }
 
         const score = await computeCompositeScore(place.lat, place.lon);
