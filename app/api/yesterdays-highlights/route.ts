@@ -75,7 +75,9 @@ export async function GET(req: Request) {
     }
 
     const sortedDates = Array.from(dates).sort();
-    const targetDate = sortedDates.at(-1);
+    const targetDate = sortedDates.length >= 2
+        ? sortedDates.at(-2)
+        : sortedDates.at(-1);
 
     if (!targetDate) {
       return NextResponse.json({ error: "no data" });
